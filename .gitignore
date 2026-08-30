@@ -1,0 +1,12 @@
+*.p8
+state.json
+state.json.tmp
+config.json
+.DS_Store
+node_modules/
+xcuserdata/
+*.xcuserstate
+.playwright-mcp/
+*.png
+!ios/Ledge/Assets.xcassets/AppIcon.appiconset/AppIcon.png
+Local.xcconfig

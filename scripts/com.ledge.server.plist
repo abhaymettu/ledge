@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template. Placeholders are filled in by scripts/install-launchd.sh, which writes the
+  result to ~/Library/LaunchAgents/com.ledge.server.plist. Do not edit the installed
+  copy; edit this and re-run the installer.
+
+    __NODE__  absolute path to node
+    __REPO__  absolute path to this repo
+    __LOG__   absolute path to the server log (~/.ledge/server.log)
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ledge.server</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <string>__REPO__/server/server.mjs</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+
+  <!-- Start at login and restart if it ever exits. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Same file the manual `node server/server.mjs >> ~/.ledge/server.log` used. -->
+  <key>StandardOutPath</key>
+  <string>__LOG__</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG__</string>
+</dict>
+</plist>

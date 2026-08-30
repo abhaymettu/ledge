@@ -1,0 +1,378 @@
+#!/bin/sh
+# ledge - drive the ledge server from a shell.
+#
+# Reads the server URL and bearer token from ~/.ledge/config.json. The token is
+# handed to curl through a config file on stdin, never on the command line, so it
+# does not show up in a process listing. It is never written to disk.
+#
+# POSIX sh, no bashisms.
+
+set -u
+
+CFG=${LEDGE_CONFIG:-$HOME/.ledge/config.json}
+LOG=${LEDGE_LOG:-$HOME/.ledge/server.log}
+
+usage() {
+  cat <<'EOF'
+ledge - push agent status onto your iPhone lock screen.
+
+  ledge status                       is the phone paired, and which lanes are live
+  ledge send <lane> <line> [opts]    start or update a lane's Live Activity
+  ledge end <lane> [line] [--tone T] end one lane
+  ledge clear [-y]                   end every live lane
+  ledge logs [-n LINES] [-f]         show the tail of the server log
+  ledge doctor                       check config, server, Apple and sessions
+  ledge pair                         print the address and token to type into the app
+  ledge -h                           this
+
+send options:
+  --template T   progress | needs_you | result | countdown   (default progress)
+  --tone T       neutral | warn | ok | fail                  (default neutral)
+  --progress N   0..1, draws the bar
+  --url U        make the card tappable (claude.ai links only)
+
+Config: ~/.ledge/config.json  ($LEDGE_CONFIG overrides)
+EOF
+}
+
+die() {
+  echo "ledge: $*" >&2
+  exit 1
+}
+
+# --- config ----------------------------------------------------------------
+
+[ -f "$CFG" ] || die "no config at $CFG. See the Setup section of the README."
+
+_cfgout=$(LEDGE_CFG_PATH="$CFG" node -e '
+try {
+  const c = JSON.parse(require("node:fs").readFileSync(process.env.LEDGE_CFG_PATH, "utf8"));
+  if (typeof c.token !== "string" || !c.token) throw new Error("no \"token\" field");
+  console.log(c.token);
+  console.log(c.url || ("http://127.0.0.1:" + (c.port || 8787)));
+} catch (e) { console.error(e.message); process.exit(1); }
+' 2>&1) || die "cannot read $CFG: $_cfgout"
+
+TOKEN=$(printf '%s\n' "$_cfgout" | sed -n 1p)
+URL=$(printf '%s\n' "$_cfgout" | sed -n 2p)
+unset _cfgout
+
+# --- http ------------------------------------------------------------------
+
+STATUS=""
+BODY=""
+
+# req METHOD PATH [JSON_BODY] -> sets STATUS and BODY
+req() {
+  _m=$1
+  _p=$2
+  _b=${3:-}
+  _tmp=""
+  # Everything secret rides in the curl config on stdin, not in argv.
+  _conf="url = \"$URL$_p\"
+request = \"$_m\"
+header = \"authorization: Bearer $TOKEN\""
+  if [ -n "$_b" ]; then
+    _tmp=$(mktemp "${TMPDIR:-/tmp}/ledge.XXXXXX") || die "cannot create a temp file"
+    printf '%s' "$_b" >"$_tmp"
+    _conf="$_conf
+header = \"content-type: application/json\"
+data-binary = \"@$_tmp\""
+  fi
+  _out=$(printf '%s\n' "$_conf" | curl -sS --max-time 10 -K - -w '\n%{http_code}' 2>&1)
+  _rc=$?
+  [ -n "$_tmp" ] && rm -f "$_tmp"
+  if [ "$_rc" -ne 0 ]; then
+    die "cannot reach the server at $URL. Is it running? ($(printf '%s\n' "$_out" | sed -n 1p))"
+  fi
+  STATUS=$(printf '%s\n' "$_out" | tail -n 1)
+  BODY=$(printf '%s\n' "$_out" | sed '$d')
+}
+
+check() {
+  case "$STATUS" in
+    2*) return 0 ;;
+    401) die "401 unauthorized: the token in $CFG does not match the running server" ;;
+    409) die "409 not paired: open the app on the phone and tap Pair" ;;
+    404) die "404: no such lane or route. ${BODY:-}" ;;
+    *) die "${STATUS:-no status} from $URL. ${BODY:-}" ;;
+  esac
+}
+
+# Pull one field out of the last JSON body. Dies on garbage rather than spewing.
+jget() {
+  LEDGE_BODY="$BODY" LEDGE_EXPR="$1" node -e '
+try {
+  const j = JSON.parse(process.env.LEDGE_BODY);
+  const f = new Function("j", "return (" + process.env.LEDGE_EXPR + ")");
+  const v = f(j);
+  if (Array.isArray(v)) { for (const x of v) console.log(x); } else if (v !== undefined) console.log(v);
+} catch { process.exit(1); }
+' 2>/dev/null || die "unexpected response from $URL: ${BODY:-empty}"
+}
+
+# --- subcommands ------------------------------------------------------------
+
+cmd_status() {
+  req GET /health ""
+  check
+  paired=$(jget 'j.paired ? "yes" : "no"')
+  lanes=$(jget 'j.lanes')
+  echo "server  $URL"
+  if [ "$paired" = yes ]; then
+    echo "paired  yes"
+  else
+    echo "paired  no   (open the app on the phone and tap Pair)"
+  fi
+  if [ -n "$lanes" ]; then
+    echo "lanes   $(printf '%s' "$lanes" | tr '\n' ' ')"
+  else
+    echo "lanes   none live"
+  fi
+}
+
+cmd_send() {
+  lane=""
+  line=""
+  template=progress
+  tone=""
+  progress=""
+  link=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --template) template=${2:-}; shift ;;
+      --tone) tone=${2:-}; shift ;;
+      --progress) progress=${2:-}; shift ;;
+      --url) link=${2:-}; shift ;;
+      -*) die "send: unknown option $1" ;;
+      *)
+        if [ -z "$lane" ]; then lane=$1
+        elif [ -z "$line" ]; then line=$1
+        else die "send: unexpected argument $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+  [ -n "$lane" ] || die "send: need a lane. ledge send <lane> <line>"
+  [ -n "$line" ] || die "send: need a line. ledge send <lane> <line>"
+
+  body=$(L="$lane" TM="$template" N="$line" T="$tone" P="$progress" U="$link" node -e '
+const e = process.env;
+const o = { lane: e.L, template: e.TM, title: e.L, line: e.N, tone: e.T || "neutral" };
+if (e.P) {
+  const n = Number(e.P);
+  if (!Number.isFinite(n)) { console.error("--progress wants a number between 0 and 1"); process.exit(1); }
+  o.progress = n;
+}
+if (e.U) o.url = e.U;
+console.log(JSON.stringify(o));
+' 2>&1) || die "$body"
+
+  req POST /activity "$body"
+  check
+  if [ "$(jget 'j.coalesced ? "y" : ""')" = y ]; then
+    echo "$lane: queued (coalesced, at most one push per lane per 30s)"
+  else
+    echo "$lane: sent ($(jget 'j.event || "update"'))"
+  fi
+}
+
+end_lane() { # end_lane LANE LINE TONE
+  body=$(L="$1" N="$2" T="$3" node -e '
+const e = process.env;
+const o = { lane: e.L, tone: e.T || "ok" };
+if (e.N) o.line = e.N;
+console.log(JSON.stringify(o));
+')
+  req POST /activity/end "$body"
+}
+
+cmd_end() {
+  lane=""
+  line=""
+  tone=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --tone) tone=${2:-}; shift ;;
+      -*) die "end: unknown option $1" ;;
+      *)
+        if [ -z "$lane" ]; then lane=$1
+        elif [ -z "$line" ]; then line=$1
+        else die "end: unexpected argument $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+  [ -n "$lane" ] || die "end: need a lane. ledge end <lane>"
+  end_lane "$lane" "$line" "$tone"
+  check
+  echo "$lane: ended"
+}
+
+cmd_clear() {
+  yes=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -y|--yes) yes=1 ;;
+      *) die "clear: unknown argument $1" ;;
+    esac
+    shift
+  done
+  req GET /health ""
+  check
+  lanes=$(jget 'j.lanes')
+  if [ -z "$lanes" ]; then
+    echo "no live lanes"
+    return 0
+  fi
+  flat=$(printf '%s' "$lanes" | tr '\n' ' ')
+  if [ "$yes" -eq 0 ]; then
+    printf 'end these lanes: %s? [y/N] ' "$flat"
+    read -r ans || ans=""
+    case $ans in
+      y|Y|yes|YES|Yes) ;;
+      *) echo "cancelled" >&2; exit 1 ;;
+    esac
+  fi
+  # Lane names are ^[a-z0-9-]+$, so plain word splitting is safe here.
+  for l in $lanes; do
+    end_lane "$l" "cleared" ok
+    case $STATUS in
+      2*) echo "$l: ended" ;;
+      404) echo "$l: already gone" ;;
+      *) echo "$l: FAILED ($STATUS ${BODY:-})" >&2 ;;
+    esac
+  done
+}
+
+cmd_logs() {
+  n=50
+  follow=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -n) n=${2:-50}; shift ;;
+      -f|--follow) follow=-f ;;
+      *) die "logs: unknown argument $1" ;;
+    esac
+    shift
+  done
+  [ -f "$LOG" ] || die "no log at $LOG. The server writes there only under launchd; see scripts/install-launchd.sh"
+  # shellcheck disable=SC2086
+  exec tail -n "$n" $follow "$LOG"
+}
+
+
+# --- doctor -----------------------------------------------------------------
+# One command that says what is broken, so nobody reads server logs at 2am.
+cmd_doctor() {
+  fails=0
+  ok()   { printf '  ok    %s\n' "$1"; }
+  warn() { printf '  warn  %s\n' "$1"; }
+  bad()  { printf '  FAIL  %s\n' "$1"; fails=$((fails + 1)); }
+
+  printf 'config\n'
+  [ -f "$CFG" ] && ok "$CFG" || bad "no config at $CFG"
+  key=$(C="$CFG" node -e 'try{const c=require(process.env.C);let p=c.keyPath||"";if(p.startsWith("~"))p=process.env.HOME+p.slice(1);process.stdout.write(p)}catch(e){}' 2>/dev/null || true)
+  if [ -n "$key" ] && [ -r "$key" ]; then
+    perm=$(stat -f '%Lp' "$key" 2>/dev/null || stat -c '%a' "$key" 2>/dev/null || echo '?')
+    [ "$perm" = "600" ] && ok "APNs key readable, mode 600" || warn "APNs key mode is $perm, want 600"
+  else
+    bad "APNs key not readable (keyPath in $CFG)"
+  fi
+
+  printf 'server\n'
+  health=$(curl -sS --max-time 4 "$URL/health" 2>/dev/null || true)
+  if [ -n "$health" ]; then
+    ok "reachable at $URL"
+    case $health in
+      *'"paired":true'*) ok 'phone paired' ;;
+      *) bad 'not paired: open the Ledge app and tap Pair' ;;
+    esac
+  else
+    bad "unreachable at $URL"
+  fi
+  if command -v launchctl >/dev/null 2>&1; then
+    if launchctl list 2>/dev/null | grep -q com.ledge.server; then
+      ok 'running under launchd (survives reboot)'
+    else
+      warn 'not under launchd: run scripts/install-launchd.sh or it dies with your terminal'
+    fi
+  fi
+
+  printf 'apple\n'
+  # Push to a syntactically valid but fake device token. BadDeviceToken proves the
+  # key, team, topic and HTTP/2 connection are all accepted; an auth error does not.
+  _self=$0
+  while [ -L "$_self" ]; do _self=$(readlink "$_self"); done
+  _apns=$(CDPATH= cd -- "$(dirname -- "$_self")/../server" && pwd)/apns.mjs
+  reason=$(C="$CFG" LEDGE_APNS="$_apns" node -e '
+    // The APNs h2 session is unreferenced, so without this hold node exits before
+    // the push resolves and the check silently reports nothing.
+    const hold = setInterval(() => {}, 1000);
+    const p = process.env.LEDGE_APNS;
+    import(p).then(async (m) => {
+      const cfg = m.loadConfig(process.env.C);
+      const r = await m.sendStart(cfg, "0".repeat(64), {
+        lane: "doctor",
+        contentState: { template: "progress", title: "doctor", line: "preflight", tone: "neutral" },
+        alert: { title: "doctor", body: "preflight" },
+      });
+      m.closeSession();
+      clearInterval(hold);
+      console.log(r.reason || r.status);
+    }).catch((e) => { clearInterval(hold); console.log("ERR " + e.message); });
+  ' 2>/dev/null | tail -1 || true)
+  case $reason in
+    BadDeviceToken) ok 'Apple accepts the key, team and topic' ;;
+    ''|ERR*)        bad "could not reach APNs ($reason)" ;;
+    *)              bad "APNs rejected the credentials: $reason" ;;
+  esac
+
+  printf 'sessions\n'
+  sd="$HOME/.claude/sessions"
+  if [ -d "$sd" ]; then
+    n=$(ls "$sd" 2>/dev/null | grep -c '\.json$' || echo 0)
+    ok "$sd readable ($n session files)"
+  else
+    warn "$sd missing: session cards will not appear"
+  fi
+
+  printf '\n'
+  [ "$fails" -eq 0 ] && { printf 'all good\n'; return 0; }
+  printf '%s check(s) failed\n' "$fails"
+  return 1
+}
+
+# --- pair -------------------------------------------------------------------
+# What the phone needs: the server as reachable over the tailnet, and the token.
+# The token is printed on purpose; this is the one place it is meant to be read.
+cmd_pair() {
+  port=$(printf "%s" "$URL" | sed -n "s|.*:\([0-9][0-9]*\)$|\1|p")
+  [ -n "$port" ] || port=8787
+  tail=$(ifconfig 2>/dev/null | awk "/inet 100\\./{print \$2}" | grep -E "^100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\." | head -1 || true)
+  if [ -n "$tail" ]; then
+    printf "  server  http://%s:%s\n" "$tail" "$port"
+  else
+    printf "  server  http://127.0.0.1:%s   (no Tailscale address found; only works on this Mac)\n" "$port"
+  fi
+  printf "  token   %s\n" "$TOKEN"
+}
+
+# --- dispatch ---------------------------------------------------------------
+
+[ $# -gt 0 ] || { usage >&2; exit 2; }
+cmd=$1
+shift
+case $cmd in
+  status) cmd_status "$@" ;;
+  send) cmd_send "$@" ;;
+  end) cmd_end "$@" ;;
+  clear) cmd_clear "$@" ;;
+  logs) cmd_logs "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  pair) cmd_pair "$@" ;;
+  -h|--help|help) usage ;;
+  *) die "unknown command '$cmd'. ledge -h for usage." ;;
+esac

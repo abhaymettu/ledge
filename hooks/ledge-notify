@@ -1,0 +1,152 @@
+#!/bin/sh
+# ledge-notify - push one Live Activity update for the current Claude Code lane.
+#
+#   ledge-notify <template> [line] [--tone T] [--progress N] [--end-after SECS]
+#   ledge-notify --end [line] [--tone T]
+#
+# template: progress | needs_you | result | countdown
+# The lane is the basename of $CLAUDE_PROJECT_DIR, lowercased.
+# With no line argument it reads the hook's stdin JSON and uses .message.
+#
+# POSIX sh, no bashisms. Never fails a hook: every path exits 0.
+
+set -u
+
+TEMPLATE=""
+LINE=""
+TONE=""
+PROGRESS=""
+END_AFTER=""
+END_NOW=0
+SESSION=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --end)       END_NOW=1 ;;
+    --tone)      TONE=${2:-}; shift ;;
+    --progress)  PROGRESS=${2:-}; shift ;;
+    --end-after) END_AFTER=${2:-}; shift ;;
+    -h|--help)   sed -n '2,12p' "$0"; exit 0 ;;
+    *)
+      if [ -z "$TEMPLATE" ] && [ "$END_NOW" -eq 0 ]; then TEMPLATE=$1
+      elif [ -z "$LINE" ]; then LINE=$1
+      fi
+      ;;
+  esac
+  shift
+done
+[ -n "$TEMPLATE" ] || TEMPLATE=progress
+
+# --- config ---------------------------------------------------------------
+cfg=$(node -e '
+const fs = require("node:fs"), os = require("node:os"), p = require("node:path");
+const c = JSON.parse(fs.readFileSync(p.join(os.homedir(), ".ledge", "config.json"), "utf8"));
+console.log(c.token);
+console.log(c.url || ("http://127.0.0.1:" + (c.port || 8787)));
+' 2>/dev/null) || cfg=""
+if [ -z "$cfg" ]; then
+  echo "ledge-notify: cannot read ~/.ledge/config.json" >&2
+  exit 0
+fi
+TOKEN=$(printf '%s\n' "$cfg" | sed -n 1p)
+URL=$(printf '%s\n' "$cfg" | sed -n 2p)
+
+# --- hook payload ---------------------------------------------------------
+# stdin can only be read once and we need two things from it: the message, and the
+# session id that makes the card tappable. Parse both in a single pass.
+if [ ! -t 0 ]; then
+  HOOK=$(node -e '
+let d = "";
+process.stdin.on("data", (c) => (d += c)).on("end", () => {
+  let m = "", s = "";
+  try { const j = JSON.parse(d); m = j.message || j.prompt || ""; s = j.session_id || ""; } catch {}
+  // The poller already words the idle state as "your turn". Claude Code phrases the
+  // same thing as "Claude is waiting for your input", and two wordings for one state
+  // on adjacent cards reads like a bug. Specific messages (a permission request names
+  // its tool) are far more useful, so those pass through untouched.
+  if (/waiting for your input/i.test(m)) m = "your turn";
+  console.log(String(m).replace(/\s+/g, " ").trim().slice(0, 60));
+  console.log(String(s).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64));
+});
+' 2>/dev/null) || HOOK=""
+  [ -n "$LINE" ] || LINE=$(printf '%s\n' "$HOOK" | sed -n 1p)
+  SESSION=$(printf '%s\n' "$HOOK" | sed -n 2p)
+  LEDGE_SESSION_ID="$SESSION"
+fi
+
+# Tapping the card opens this session. The server allowlists the host, so a missing
+# or malformed id simply means the card is not tappable.
+if [ -n "$SESSION" ]; then LINK="https://claude.ai/code/session_$SESSION"; else LINK=""; fi
+
+# --- lane -----------------------------------------------------------------
+# The session poller cards every busy Claude Code session under `cc-<name>`. When a
+# hook fires for a session the poller already knows about, it must target THAT lane
+# so the existing card turns orange, rather than opening a second card for the same
+# session. Resolved by matching our session_id against ~/.claude/sessions.
+LANE=""
+if [ -n "${LEDGE_SESSION_ID:-}" ]; then
+  LANE=$(SID="$LEDGE_SESSION_ID" node -e '
+const fs = require("fs"), os = require("os"), path = require("path");
+const dir = path.join(os.homedir(), ".claude", "sessions");
+let out = "";
+try {
+  for (const f of fs.readdirSync(dir)) {
+    if (!/^\d+\.json$/.test(f)) continue;
+    let j; try { j = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8")); } catch { continue; }
+    if (j.sessionId !== process.env.SID) continue;
+    const raw = j.name || (j.cwd && path.basename(j.cwd)) || String(j.pid);
+    const clean = String(raw).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+    out = ("cc-" + (clean || j.pid)).slice(0, 24);
+    break;
+  }
+} catch {}
+console.log(out);
+' 2>/dev/null) || LANE=""
+fi
+
+# Fall back to the project directory when the session is not in the registry, which
+# is the case for non-interactive runs and for anything that is not Claude Code.
+[ -n "$LANE" ] || LANE=$(basename "${CLAUDE_PROJECT_DIR:-$PWD}")
+LANE=$(printf '%s' "$LANE" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | cut -c1-24)
+[ -n "$LANE" ] || LANE=lane
+
+
+post() { # post <path> <json>
+  curl -sS --max-time 8 -o /dev/null -X POST "$URL$1" \
+    -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d "$2" || true
+}
+
+if [ "$END_NOW" -eq 1 ]; then
+  body=$(L=$LANE N=$LINE T=${TONE:-ok} node -e \
+    'const e=process.env;console.log(JSON.stringify({lane:e.L,line:e.N||"done",tone:e.T}))')
+  post /activity/end "$body"
+  exit 0
+fi
+
+body=$(L=$LANE TM=$TEMPLATE N=$LINE T=${TONE:-neutral} P=$PROGRESS U=$LINK node -e '
+const e = process.env;
+// No title: the poller owns the card label. Sending one here would replace the
+// session title with the routing key.
+const o = { lane: e.L, template: e.TM, line: e.N || "", tone: e.T };
+if (e.P) o.progress = Number(e.P);
+if (e.U) o.url = e.U;
+console.log(JSON.stringify(o));
+')
+post /activity "$body"
+
+# Stop hook: show the result, then clear the lock screen a little later.
+# The end payload goes through a temp file so an apostrophe in the line cannot
+# break out of the backgrounded shell command.
+if [ -n "$END_AFTER" ]; then
+  case "$END_AFTER" in
+    ''|*[!0-9]*) echo "ledge-notify: --end-after wants whole seconds" >&2; exit 0 ;;
+  esac
+  tmp=$(mktemp "${TMPDIR:-/tmp}/ledge-end.XXXXXX") || exit 0
+  L=$LANE N=$LINE T=${TONE:-ok} node -e \
+    'const e=process.env;console.log(JSON.stringify({lane:e.L,line:e.N||"done",tone:e.T}))' > "$tmp"
+  nohup sh -c "sleep $END_AFTER; curl -sS --max-time 8 -o /dev/null -X POST \"$URL/activity/end\" \
+    -H \"authorization: Bearer $TOKEN\" -H 'content-type: application/json' --data-binary @\"$tmp\"; \
+    rm -f \"$tmp\"" >/dev/null 2>&1 &
+fi
+
+exit 0
