@@ -1,15 +1,50 @@
 # ledge
 
-Push agent status onto an iPhone lock screen and Dynamic Island over a local webhook.
-Any agent that can run `curl` gets a Live Activity. Self-hosted end to end: your Mac,
-your Apple developer account, your APNs key. Nothing leaves the tailnet except the
-Apple push itself.
+Your coding agents, on your iPhone lock screen.
 
-    agent (curl) --> ledge server (Mac, node) --> APNs --> iPhone
+A Live Activity for every Claude Code session running on your Mac: what it is doing
+right now, how long it has been at it, and the exact question it asked when it is
+waiting on you. Tap the card and that session opens in the Claude app. Self-hosted end
+to end: your Mac, your Apple developer account, your APNs key. Zero dependencies on
+both sides. Nothing leaves your tailnet except the push to Apple.
 
-Zero dependencies on both sides. The server is node built-ins only, with no
-`package.json` and nothing to install. See [SPEC.md](SPEC.md) for the design and the
-non-goals.
+<p align="center"><img src="docs/card.svg" width="360" alt="Two lock screen cards: a sky-blue 'your turn' card asking a question, and a yellow working card running tests"></p>
+
+## What you see
+
+One card per session, one line each, and the colour of the rim is the state. The
+palette is colour-blind safe (Okabe-Ito), and the text carries the state on its own.
+
+| State | Rim | The line | Trailing | When |
+| --- | --- | --- | --- | --- |
+| Working | yellow | what it is doing: "running node --test", "editing poller.mjs" | elapsed | the session is mid-turn |
+| **Your turn** | sky blue, bright | the question it asked, or "your turn" | how long it has waited | Claude ended its turn on a question |
+| Stuck | vermilion | "no output for 12m" | elapsed | busy but silent for 10 minutes |
+| On a loop | dim white | the loop's own reason | countdown to the next wake | parked on `/loop` (ScheduleWakeup) |
+| Done / failed | green / purple | your text | "done" / "failed" | hook or `ledge send` result cards |
+
+The Dynamic Island shows the card that needs you most: an unanswered question outranks
+everything, and the longer it has been ignored the higher it climbs. The title is a
+2-4 word summary of what the session is about, made once by `claude -p --model haiku`
+and refreshed when the session drifts.
+
+Any other agent gets a card the same way, with no adapter: `ledge send build "compiling"
+--progress 0.4` from a shell, or a `curl` to the [API](#api).
+
+## How it works
+
+    ~/.claude/sessions/*.json  --poll 3s-->  ledge server (Mac, node, zero deps)  --HTTP/2-->  APNs  -->  iPhone
+    ~/.claude/projects/**.jsonl  (transcript tail: activity, last question, loop state)
+
+- Claude Code keeps a registry of its own sessions. The server reads it every 3 s and
+  the last 256 KB of each transcript to say what the session is doing.
+- The server signs an ES256 JWT and pushes Live Activity updates to Apple itself. It
+  binds only to loopback and your Tailscale address. There is no relay and no account.
+- The iOS app pairs once (hands its push tokens to the server) and then mostly stays
+  closed. It has a Restore button for cards you swiped away and a list of live sessions.
+- Nobody but you is in the push path. That is the whole point, and it is why there is
+  no App Store build: an app can only be pushed to by the key of the team that signed
+  it, so you build it yourself (`install.sh` does it for you).
 
 **What you need**
 
@@ -388,12 +423,13 @@ not globbed. Pass the glob.
 ## Publishing a public snapshot
 
 `scripts/publish.sh` pushes a sanitized copy of the working tree to a **separate** public
-repo as a single fresh commit. It is not a mirror, and `git push public` by hand is never
-the right move: a private history can hold a tailnet address or a Team ID in an old
-commit even when the current tree is clean, and a mirror carries all of it.
+repo, one commit per publish on top of the public history. It is not a mirror, and
+`git push public` by hand is never the right move: a private history can hold a tailnet
+address or a Team ID in an old commit even when the current tree is clean, and a mirror
+carries all of it. The public history only ever contains snapshots that passed the guard.
 
     scripts/publish.sh --dry-run                  build the snapshot, run the guard, stop
-    scripts/publish.sh                            the same, then force-push
+    scripts/publish.sh                            the same, then push one commit
     scripts/publish.sh --remote git@github.com:you/ledge-public.git
     scripts/publish.sh -y                         skip the confirmation prompt
 

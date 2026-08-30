@@ -2,12 +2,13 @@
 # Push a sanitized snapshot of the working tree to a SEPARATE public repo.
 #
 # This repo's history contains a Tailscale address and an Apple Team ID in older
-# commits. The public repo is therefore a fresh single-commit history, built in a temp
-# directory and force-pushed. It is never a mirror of this one, and `git push public`
-# by hand is never the right move.
+# commits. The public repo therefore gets snapshots of the tree, one commit per
+# publish on top of its own history (changed from a force-pushed single commit on
+# 2026-08-29, the day it went public: a force-push breaks every clone). It is never
+# a mirror of this one, and `git push public` by hand is never the right move.
 #
 #   scripts/publish.sh --dry-run           build the snapshot, run the guard, stop
-#   scripts/publish.sh                     the same, then force-push to the `public` remote
+#   scripts/publish.sh                     the same, then push one commit to the `public` remote
 #   scripts/publish.sh --remote URL        override the remote
 #   scripts/publish.sh -y                  skip the confirmation prompt
 #
@@ -128,14 +129,14 @@ echo "guard: clean ($COUNT files)"
 # --- push -------------------------------------------------------------------
 
 if [ "$DRY" -eq 1 ]; then
-  echo "dry run, nothing pushed. Would force-push these to ${REMOTE:-<no remote>} $BRANCH:"
+  echo "dry run, nothing pushed. Would push these to ${REMOTE:-<no remote>} $BRANCH:"
   (cd "$SNAP" && find . -type f | sed 's|^\./|  |' | sort)
   exit 0
 fi
 
 echo "target: $REMOTE  $BRANCH"
 if [ "$YES" -eq 0 ]; then
-  printf 'force-push %s files as a single fresh commit, replacing the public history? [y/N] ' "$COUNT"
+  printf 'push %s files as one commit on top of the public history? [y/N] ' "$COUNT"
   read -r ans || ans=""
   case $ans in
     y|Y|yes|YES|Yes) ;;
@@ -143,9 +144,22 @@ if [ "$YES" -eq 0 ]; then
   esac
 fi
 
-cd "$SNAP"
-git init -q -b "$BRANCH"
+# Clone the public history, replace its tree with the snapshot, commit the diff.
+# The commit subject is the private HEAD's, which is prose, not a file, and the
+# guard has already passed the files it describes.
+PUB="$TMP/pub"
+if git clone -q --branch "$BRANCH" "$REMOTE" "$PUB" 2>/dev/null; then
+  (cd "$PUB" && git ls-files -z | xargs -0 rm -f)
+else
+  mkdir -p "$PUB" && git -C "$PUB" init -q -b "$BRANCH"
+fi
+(cd "$SNAP" && tar -cf - .) | (cd "$PUB" && tar -xf -)
+cd "$PUB"
 git add -A
-git commit -q -m "ledge $(date +%Y-%m-%d)"
-git push --force "$REMOTE" "$BRANCH:$BRANCH"
-echo "pushed $COUNT files to $REMOTE $BRANCH"
+if git diff --cached --quiet; then
+  echo "public repo already matches the snapshot, nothing to push"
+  exit 0
+fi
+git commit -q -m "$(git -C "$ROOT" log -1 --format=%s)" -m "Snapshot of the working tree, $(date +%Y-%m-%d)."
+git push -q "$REMOTE" "$BRANCH:$BRANCH"
+echo "pushed 1 commit ($COUNT files) to $REMOTE $BRANCH"

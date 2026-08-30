@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="176" viewBox="0 0 360 176" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+  <defs>
+    <linearGradient id="rimAsk" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#66b8f5" stop-opacity="0.66"/><stop offset="0.26" stop-color="#fff" stop-opacity="0.05"/><stop offset="1" stop-color="#fff" stop-opacity="0.035"/>
+    </linearGradient>
+    <linearGradient id="rimWork" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f5db47" stop-opacity="0.36"/><stop offset="0.26" stop-color="#fff" stop-opacity="0.05"/><stop offset="1" stop-color="#fff" stop-opacity="0.035"/>
+    </linearGradient>
+    <radialGradient id="bloomAsk" cx="0.5" cy="-0.08" r="0.9"><stop offset="0" stop-color="#66b8f5" stop-opacity="0.18"/><stop offset="1" stop-color="#66b8f5" stop-opacity="0"/></radialGradient>
+    <radialGradient id="bloomWork" cx="0.5" cy="-0.08" r="0.9"><stop offset="0" stop-color="#f5db47" stop-opacity="0.06"/><stop offset="1" stop-color="#f5db47" stop-opacity="0"/></radialGradient>
+  </defs>
+  <rect width="360" height="176" fill="#000"/>
+  <!-- your turn -->
+  <g transform="translate(10,10)">
+    <rect width="340" height="62" rx="22" fill="#000"/>
+    <rect width="340" height="62" rx="22" fill="url(#bloomAsk)"/>
+    <rect x="0.4" y="0.4" width="339.2" height="61.2" rx="21.6" fill="none" stroke="url(#rimAsk)" stroke-width="0.8"/>
+    <text x="15" y="22" font-size="9" font-weight="500" fill="#66b8f5">Ledge public launch</text>
+    <text x="325" y="22" font-size="9.5" font-weight="500" fill="#fff" fill-opacity="0.42" text-anchor="end">14:09</text>
+    <text x="15" y="45" font-size="15" font-family="'New York', 'Iowan Old Style', Georgia, serif" fill="#fff">Should I also push the tag?</text>
+  </g>
+  <!-- working -->
+  <g transform="translate(10,90)">
+    <rect width="340" height="62" rx="22" fill="#000"/>
+    <rect width="340" height="62" rx="22" fill="url(#bloomWork)"/>
+    <rect x="0.4" y="0.4" width="339.2" height="61.2" rx="21.6" fill="none" stroke="url(#rimWork)" stroke-width="0.8"/>
+    <text x="15" y="22" font-size="9" font-weight="500" fill="#f5db47" fill-opacity="0.85">Session poller tests</text>
+    <text x="325" y="22" font-size="9.5" font-weight="500" fill="#fff" fill-opacity="0.42" text-anchor="end">3:41</text>
+    <text x="15" y="45" font-size="15" font-family="'New York', 'Iowan Old Style', Georgia, serif" fill="#fff">running node --test</text>
+  </g>
+</svg>
