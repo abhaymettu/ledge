@@ -40,6 +40,79 @@ key of the team that signed it, so any binary distribution implies that relay. D
 manual part. Bundle ID and team come from `ios/Local.xcconfig` (gitignored, generated)
 through the `LEDGE_BUNDLE_ID` build setting, so the project file stays untouched.
 
+## The island and the banner mean "act now" (2026-08-29)
+
+An update whose state is `asking` or `approval` carries an APNs `alert` (title, line,
+default sound); Apple's docs: it "lights up the device and displays the expanded
+presentation in the Dynamic Island". No other state alerts. The compact and minimal
+island presentations render nothing for any state that does not need him, so an occupied
+island is a decision waiting; long-press still expands any card. A per-card opt-out of
+the island does not exist in ActivityKit: the island shows the highest relevance card,
+which is why asking is 90 to 100 and approval 100. Push-to-start must carry an alert, so
+a brand-new working card still lights the screen once; that is Apple's rule, not ours.
+
+## Approvals: decide from the phone (2026-08-29)
+
+The product redesign's core loop: an agent needs a decision, he makes it from the
+phone, the agent continues. Claude Code's `PermissionRequest` hook runs
+`hooks/ledge-approve`, which POSTs `/approvals` `{sessionId, tool, input, cwd}` and
+long-polls `GET /approvals/<id>?wait=<ms>` (default 120 s, `LEDGE_APPROVE_WAIT_MS`).
+The poller sees the pending approval for that session and its card becomes state
+`approval`: line `allow: <what the tool wants>` ("force-push the branch", "edit
+poller.mts"), relevance 100, the ask accent, and, only on this state, Allow and Deny
+buttons on the lock screen card and in the expanded island. The buttons are a
+`LiveActivityIntent` (`DecideIntent`), which iOS runs in the app's process, so it reads
+the app's server URL and token and POSTs `/approvals/<id> {decision}`; the app's inbox
+does the same. The hook then prints the `hookSpecificOutput` decision Claude Code
+expects.
+
+**Nothing is ever allowed without a human.** No answer within the wait, or ledge
+unreachable, prints nothing, and the normal terminal prompt proceeds. A deny is a
+deny with the reason "denied from the phone". Approvals live in memory: a server
+restart drops them and the hooks fall through to the terminal.
+
+**Replies to a session from the phone are bridge-only.** The spike (2 hours, budgeted):
+every session listens on `/tmp/cc-socks/<pid>.sock`, the transport behind Claude
+Code's own session-to-session `SendMessage`. It accepts a connection and answers
+nothing to a JSON hello; the protocol is minified and undocumented and the CLI exposes
+no send command. Tapping a card still opens the session in the Claude app, which is
+where a free-text reply happens.
+
+**The inbox.** The paired app is one screen: *Needs you* (approvals with Allow/Deny,
+then sessions asking a question), *Running*, *Done today* (from `GET /history`: the
+server keeps the last 50 ended lanes with their final card and outcome in
+`state.json`). Settings, Pair again and Restore sit behind a gear.
+
+## The code has no comments
+
+Decided 2026-08-29, with the redesign. Every constraint that was a comment is now a test
+named for it, a type that forbids the bug, or a constant that feeds the other constant
+it had to agree with; the story of why lives here. What a reader needs to know that the
+code cannot say on its own:
+
+- **APNs transport.** One HTTP/2 session is reused for every push. Apple sends GOAWAY
+  periodically; the session is dropped and the next push reconnects. The provider JWT
+  is minted with the JOSE raw r||s signature (`ieee-p1363`); DER is rejected. It is
+  cached for 45 minutes because Apple refuses a refresh under 20 minutes apart
+  (`TooManyProviderTokenUpdates`).
+- **Auth** compares the bearer token with `crypto.timingSafeEqual`. Request bodies over
+  1 MB are refused with 413 before parsing.
+- **Ends dismiss at once** (`END_DISMISS_MS = 0`; the 60 s grace named earlier in this
+  file is gone): three green "done" cards sat on the lock screen for hours otherwise.
+- **The claude binary** is resolved at startup across `~/.local/bin`, `/opt/homebrew/bin`
+  and `/usr/local/bin`: under launchd PATH is nearly empty and the owner's interactive
+  `claude` is a shell function. Titles are summarised with an argument list, never a
+  shell string, and with cwd in tmpdir so no project CLAUDE.md leaks into the call.
+- **The poller adopts cards** left by a previous run with `pid: null`, never 0 or -1:
+  `process.kill(0, 0)` signals the process group and would report the card alive forever.
+  A 4xx from the server is remembered by body signature, not by lane, so a lane recovers
+  as soon as its content changes.
+- **Transcript tails** are read as the last 256 KB with the partial first line dropped
+  (a single line can exceed 96 KB), cached by mtime and size so an unchanged file costs
+  one stat per tick.
+- **Tool phrases** are looked up in a table with a null prototype, so a tool named
+  `constructor` cannot reach up the chain.
+
 ## Architecture
 
 Three pieces.
@@ -88,22 +161,32 @@ otherwise untouched. The original screen, kept for the record:
 **Widget extension.** One `ActivityAttributes`, not four:
 
 ```swift
+enum CardState: String, Codable { case working, asking, stuck, resting, done, failed }
+
 struct AgentActivity: ActivityAttributes {
-    var lane: String                  // "networking", fixed at start, never changes
+    var lane: String                  // fixed at start, never changes
     struct ContentState: Codable, Hashable {
-        var template: String          // progress | needs_you | result | countdown
-        var title: String             // <= 32 chars, e.g. "networking"
-        var line: String              // <= 60 chars, e.g. "drafting 3 outreach emails"
-        var progress: Double?         // 0...1, progress template only
-        var startedAt: Date?          // progress: drives the elapsed timer
-        var deadline: Date?           // countdown: drives the ticking timer
-        var tone: String              // neutral | warn | ok | fail
+        var state: CardState          // the one thing a card is
+        var title: String             // <= 32 chars, the session title
+        var line: String              // <= 60 chars
+        var progress: Double?         // 0...1, working or stuck only
+        var startedAt: Date?          // elapsed timer (asking: how long it has waited)
+        var deadline: Date?           // resting: counts down to the next wake
+        var url: String?              // claude://code/<id> or https://claude.ai/...
     }
 }
 ```
 
-The widget switches on `template`. Adding a fifth template later is one new case.
-Unknown template string falls back to `progress` rather than rendering blank.
+**One `CardState`** (redesign of 2026-08-29). The card used to be `template × tone`,
+and "what state is this" was re-derived in four places: the server's card copy, its
+relevance score, the widget's colour logic and the app's session rows, each with its
+own if-chain. `server/card-state.mts` owns the union now; the API still accepts
+`template` + `tone` for callers that speak that vocabulary and maps them at the
+boundary (`stateOf`), the poller sends `state` directly, and the phone decodes
+`state` alone. The widget and the app switch on it exhaustively, so a seventh state
+next year fails the Swift compiler instead of rendering grey. A state this build does
+not know decodes as `working`, never blank. Relevance: asking 90 to 100 (longer
+ignored is higher), failed 85, stuck 70, done 60, resting 40, working 20.
 
 ### 2. Server
 
@@ -146,7 +229,7 @@ require it. Reject with 401 and no body.
   ghost the phone still shows for a lane already ended, and storing it would leave a
   card nothing could ever remove. The app reports every card's token each time it
   comes to the foreground (`reconcile`), which is how ghosts get found.
-- `POST /activity` `{lane, template, title, line, progress?, deadline?, tone?}` -> 200
+- `POST /activity` `{lane, template, title, line, progress?, deadline?, tone?, state?}` -> 200
   - no entry for `lane`: push-to-start (`event: "start"`) to the push-to-start token
   - entry exists: `event: "update"` to that lane's update token
   - unknown lane on update because the phone never reported a token: fall back to
@@ -160,6 +243,10 @@ require it. Reject with 401 and no body.
   the new token arrives through `/token`. A first version pushed-to-start from the
   server instead; every push was accepted by APNs and the phone created none, which
   is Apple's documented hourly ActivityKit budget. Local starts need no budget.
+- `POST /approvals` `{sessionId, tool, input, cwd}` -> 201 `{id}`; `GET /approvals` -> the
+  pending list; `GET /approvals/<id>?wait=<ms>` -> `{decision: allow | deny | null}`
+  after the decision or the wait; `POST /approvals/<id>` `{decision}` -> 204.
+- `GET /history` -> `{history: [{lane, card, endedAt, outcome}]}`, newest last.
 - `GET /health` -> `{ok: true, lanes: [...]}`. No auth needed on this one.
 
 **Validation at the boundary.** `lane` must match `^[a-z0-9-]{1,24}$`. `template` must
@@ -213,13 +300,12 @@ intended behavior, not a bug.
 
 ### 4. Session poller
 
-`server/sessions.mjs`, started from `main()` alongside the HTTP listener. That file
-is a barrel: the implementation is split by concern into `server/claude-state.mjs`
-(everything that reads Claude Code's internal files and knows their shape — the
-whole blast radius of an upstream format change is that one file),
-`server/card-copy.mjs` (pure text: phrasing, truncation, time formatting, no I/O),
-and `server/poller.mjs` (the poll loop and card lifecycle). `server.mjs` and the
-tests import only from the barrel. Claude Code
+`server/poller.mts`, started from `main()` alongside the HTTP listener. Everything
+that reads Claude Code's internal files and knows their shape is `server/claude.mts`
+(the whole blast radius of an upstream format change is that one file; it returns typed
+`Session`s with the status settled), `server/card.mts` is pure text plus `cardFor`
+(Session -> card, the one place the CardState is decided), `server/titles.mts` is the
+summariser. Claude Code
 already tracks what every session is doing in `~/.claude/sessions/<pid>.json`
 (`kind`, `status`, `statusUpdatedAt`, `name`, `cwd`, `bridgeSessionId`). The poller
 reads that directory every `pollMs` and puts a card up for each session that is
@@ -244,8 +330,17 @@ for hours, so he saw stale cards). Decided 2026-08-29:
   make the loud state meaningless. The check reuses the stat the activity cache
   already takes; a missing transcript is never called stuck (no evidence either
   way).
-- **WAITING** (any other status — `idle`, `shell`, anything unknown — while the pid
-  lives): template `needs_you`, tone `warn`, `line` = the question Claude just
+- **IDLE** (decided 2026-08-30, replacing "idle means your turn"): a session that
+  ended its turn without asking anything is `idle`: quiet white, `line` = the last
+  sentence it said ("Build 21 is in TestFlight"), relevance 10 so it never takes the
+  island, ranked last under the cap, and its card leaves the lock screen after
+  `IDLE_CARD_MS` (30 min) while the session stays alive; going busy again earns a
+  fresh card. "Needs you" is exactly: an approval, or an `asking` card, which requires a
+  real question (a "?" sentence in the last text, or an AskUserQuestion). The app shows
+  needs you / running / idle / done today.
+- **ASKING** (formerly WAITING; any non-busy status — `idle`, `shell`, anything
+  unknown — while the pid lives, with a question): template `needs_you`, tone `warn`,
+  `line` = the question Claude just
   asked, read from the transcript tail (the newest `assistant` entry with a text
   block; markdown stripped — fences and their contents, backticks, bold/italic
   asterisks, link syntax keeping the label, bullets, heading hashes, and table
@@ -268,11 +363,20 @@ started the turn so the timer does not reset on every tool call. Same tail windo
 stat cache as the activity read. A session file that carries a `status` is never
 second-guessed.
 
+**Watching, decided 2026-08-30.** A busy session whose newest tool call is a waiting
+tool (`Monitor`, `ScheduleWakeup`) is `resting`, not working: it is the loop between its
+checks, blocked until a condition or a timer. Line = the tool's own description or reason;
+no stuck check (silence is the point); a Monitor has no known wake time so the trailing
+slot shows elapsed, a ScheduleWakeup counts down. A loop iteration that is editing or
+running commands is `working` like anything else. That is how "looping and coding" and
+"looping and idle" tell apart.
+
 **Parked on a /loop** (decided 2026-08-29): a session that ended its turn on a
 `ScheduleWakeup` is idle to Claude Code but is not waiting on him; it wakes itself.
 Carding it `needs_you` "your turn" was wrong. `pendingWakeup` reads the newest
-`ScheduleWakeup` tool_use from the transcript tail (ignored if `stop: true`, or if
-a real prompt came after it); while the wake is still due, or overdue by under
+`ScheduleWakeup` tool_use from the transcript tail (ignored if `stop: true`; a reply
+he types after it does NOT cancel it, the wake keeps its appointment, corrected
+2026-08-29 after "cool ty" flipped a loop to "your turn"); while the wake is still due, or overdue by under
 `WAKE_GRACE_MS` (2 min), the card is template `countdown`, tone neutral, `line` =
 the loop's own `reason` ("watching CI run"), `deadline` = the wake time so the
 trailing slot counts down to it, `startedAt` = when it was scheduled. It ranks
@@ -378,7 +482,11 @@ When more than `maxCards` sessions qualify, WAITING sessions idle for under
 `WAITING_FRESH_MS` (30 min) beat WORKING ones (a session that just asked for him
 matters more than one happily working), then longest in its current state first;
 WAITING sessions older than that rank last (decided 2026-08-29: they are abandoned,
-not waiting, and four of them hid the bridge session he was typing in); the rest are ended or ignored, so the lock screen cannot be
+not waiting, and four of them hid the bridge session he was typing in). A card that is
+already up ranks above any working newcomer (later on 2026-08-29: with five sessions and
+a cap of four, evict-and-readmit churn ended and restarted the same lane every few ticks
+and left two activities on the phone for one lane); only a session that needs him can
+take a slot from a working card; the rest are ended or ignored, so the lock screen cannot be
 flooded.
 
 This reads undocumented internal state from another program, so it trusts nothing:
@@ -584,16 +692,21 @@ phone is the test.
       SPEC.md
       LICENSE            MIT
       .gitignore         *.p8, state.json, config.json, xcuserdata
-      server/
-        server.mjs
-        apns.mjs
-        sessions.mjs      barrel re-exporting the three below
-        claude-state.mjs  reads Claude Code's session files and transcripts
-        card-copy.mjs     pure text: phrasing, truncation, formatting
-        poller.mjs        poll loop and card lifecycle
-        server.test.mjs
-        sessions.test.mjs
-        test.sh
+      server/            TypeScript, run by node directly; no comments, see above
+        server.mts       routing, auth, APNs I/O, main
+        lanes.mts        the lane lifecycle: Lane union, transitions, state file
+        coalescer.mts    one push per lane per 30 s
+        validate.mts     the API boundary: raw body -> request, request -> Card
+        card-state.mts   CardState, Card, relevance
+        apns.mts         HTTP/2 + ES256 JWT transport
+        claude.mts       Claude Code's files: readSessions -> Session, transcript reads
+        titles.mts       the haiku title summariser and its schedule
+        card.mts         pure text, and cardFor: Session -> the card
+        poller.mts       the poll loop
+        verify.mts       ledge verify
+        *.test.mts
+      tsconfig.json
+      scripts/check.sh
       hooks/
         hooks.json
         ledge-notify

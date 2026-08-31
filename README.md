@@ -19,6 +19,7 @@ palette is colour-blind safe (Okabe-Ito), and the text carries the state on its 
 | --- | --- | --- | --- | --- |
 | Working | yellow | what it is doing: "running node --test", "editing poller.mjs" | elapsed | the session is mid-turn |
 | **Your turn** | sky blue, bright | the question it asked, or "your turn" | how long it has waited | Claude ended its turn on a question |
+| **Approval** | sky blue, bright, with Allow / Deny | "allow: force-push the branch" | how long it has waited | a tool needs permission; your answer goes back to the session |
 | Stuck | vermilion | "no output for 12m" | elapsed | busy but silent for 10 minutes |
 | On a loop | dim white | the loop's own reason | countdown to the next wake | parked on `/loop` (ScheduleWakeup) |
 | Done / failed | green / purple | your text | "done" / "failed" | hook or `ledge send` result cards |
@@ -27,6 +28,12 @@ The Dynamic Island shows the card that needs you most: an unanswered question ou
 everything, and the longer it has been ignored the higher it climbs. The title is a
 2-4 word summary of what the session is about, made once by `claude -p --model haiku`
 and refreshed when the session drifts.
+
+**Approve from the phone.** With the `PermissionRequest` hook installed (`install.sh`
+does it), a tool that needs permission puts an approval card on the lock screen with
+Allow and Deny; the answer goes back to the session. No answer within two minutes, or
+the Mac unreachable, and the usual terminal prompt appears instead. Nothing is allowed
+without a human.
 
 Any other agent gets a card the same way, with no adapter: `ledge send build "compiling"
 --progress 0.4` from a shell, or a `curl` to the [API](#api).
@@ -140,7 +147,7 @@ You only ever do this block once.
 
 ### 3. Run the server
 
-    node server/server.mjs
+    node server/server.mts
 
 It binds `127.0.0.1` and your Tailscale address (auto-detected: any interface IPv4 in
 the CGNAT range `100.64.0.0/10`), both on `port`, and nothing else. An optional
@@ -267,6 +274,11 @@ missing token is `401` with no body.
 | `POST` | `/activity` | `{lane, template, title?, line?, progress?, deadline?, tone?}` | `200` |
 | `POST` | `/activity/end` | `{lane, line?, tone?}` | `200` |
 | `GET` | `/lanes` | — | `{lanes: {lane: contentState}}` |
+| `POST` | `/approvals` | `{sessionId, tool, input, cwd}` | `201 {id}` |
+| `GET` | `/approvals` | — | `{approvals: [...]}` |
+| `GET` | `/approvals/<id>?wait=ms` | — | `{decision}` once decided, or null |
+| `POST` | `/approvals/<id>` | `{decision: allow \| deny}` | `204` |
+| `GET` | `/history` | — | `{history: [...]}` |
 
 **Boundary rules**, enforced before anything reaches Apple:
 
@@ -345,12 +357,14 @@ itself; never push just to advance a clock.
 
 ## Claude Code hooks
 
-Every lane gets its own activity, keyed by the basename of `$CLAUDE_PROJECT_DIR`
-lowercased. Six lanes means six concurrent activities. That is intended.
+The session poller puts up and takes down the cards; the hooks add the two things
+it cannot see from the outside:
 
-- `SessionStart` → `progress`, line `started`
-- `Notification` → `needs_you`, tone `warn`, line carries the notification message
-- `Stop` → `result`, tone `ok`, then `/activity/end` 30 seconds later
+- `Notification` → the session's card turns into "your turn" with the notification's
+  message the moment Claude asks, instead of on the next poll
+- `PermissionRequest` → `ledge-approve`: the request waits on the phone (see above)
+
+The earlier `SessionStart` and `Stop` cards are gone: the poller covers both.
 
 ### Install
 
@@ -393,9 +407,10 @@ a dead ledge server must never fail a hook or block a session.
 ## Other agents
 
 Today the session poller reads Claude Code's own state. Everything that knows the
-shape of Claude Code's files lives in `server/claude-state.mjs`; `server/poller.mjs`
-only asks it for a list of sessions. That is the seam for a second agent: a
-`codex-state.mjs` that returns the same shape, and the poller unions the lists.
+shape of Claude Code's files lives in `server/claude.mts`, whose `readSessions` returns
+typed `Session`s with the status already settled; `server/poller.mts` only consumes that
+list. That is the seam for a second agent: a `codex.mts` that returns the same `Session`
+shape, and the poller unions the lists.
 
 What is known about Codex CLI (checked against a real `~/.codex` on 2026-08-29,
 cli 0.81): it writes one rollout per session to
@@ -412,11 +427,16 @@ the [API](#api) are the whole contract.
 
 ## Tests
 
-    node --test server/*.test.mjs     # validator and coalescer, APNs stubbed
-    ./server/test.sh                  # live, against a paired phone
+    scripts/check.sh                  # type-check (tools cached outside the repo) then node --test
+    ledge verify                      # live: a synthetic session goes working -> asking -> gone
 
-`node --test server/` does not work on node 26; the positional is loaded as a module,
-not globbed. Pass the glob.
+`ledge verify` writes one session file and one transcript under `~/.claude` for the
+length of the run, watches `/lanes` for the card it expects at each step, and removes
+both. The last thing it prints is what the lock screen should have shown.
+
+The server is TypeScript run directly by Node 26 (type stripping); nothing is compiled
+and nothing is installed into the repo. `scripts/check.sh` keeps `typescript` and
+`@types/node` in `~/.cache/ledge-check` for the type check only.
 
 ---
 

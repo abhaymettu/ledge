@@ -31,7 +31,15 @@ xcodebuild -project Ledge.xcodeproj -scheme Ledge -destination 'generic/platform
   DEVELOPMENT_TEAM="$TEAM" archive
 xcodebuild -exportArchive -archivePath "$OUT/Ledge.xcarchive" -exportPath "$OUT/export" \
   -exportOptionsPlist "$OUT/export.plist" -allowProvisioningUpdates
-xcrun altool --upload-app -f "$OUT/export/Ledge.ipa" -t ios --apiKey "$KEY" --apiIssuer "$ISS"
+# altool exits 0 even when Apple rejects the package (409 upload-limit, bad entitlements),
+# so its status is not the truth. Read the log, or the script announces a build that never
+# left the Mac and leaves the version bumped past it. Cost build 24 on 2026-08-30.
+xcrun altool --upload-app -f "$OUT/export/Ledge.ipa" -t ios --apiKey "$KEY" --apiIssuer "$ISS" 2>&1 | tee "$OUT/upload.log"
+if grep -q "UPLOAD FAILED" "$OUT/upload.log"; then
+  sed -i '' "s/CURRENT_PROJECT_VERSION = $NEXT;/CURRENT_PROJECT_VERSION = $CUR;/g" "$PBX"
+  echo "upload rejected (see the error above); version rolled back to $CUR" >&2
+  exit 1
+fi
 echo "uploaded build $NEXT, waiting for Apple to process it"
 
 # Wait for Apple to process it, then hand it to the Internal group so it shows up in

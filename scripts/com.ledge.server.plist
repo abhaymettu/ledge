@@ -17,7 +17,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>__NODE__</string>
-    <string>__REPO__/server/server.mjs</string>
+    <string>__REPO__/server/server.mts</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -29,7 +29,7 @@
   <key>KeepAlive</key>
   <true/>
 
-  <!-- Same file the manual `node server/server.mjs >> ~/.ledge/server.log` used. -->
+  <!-- Same file the manual `node server/server.mts >> ~/.ledge/server.log` used. -->
   <key>StandardOutPath</key>
   <string>__LOG__</string>
   <key>StandardErrorPath</key>

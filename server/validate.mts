@@ -1,33 +1,27 @@
-// Boundary validation for the ledge server. Each field's rule is declared once;
-// validateActivity walks them in order. Everything returns {error} or {value},
-// never throws.
+import { appleDate, isState, stateOf, STATES, TEMPLATES, TONES, type Card } from './card-state.mts'
+export { TEMPLATES, TONES }
 
-import { appleDate } from './apns.mjs'
-
-export const TEMPLATES = ['progress', 'needs_you', 'result', 'countdown']
-export const TONES = ['neutral', 'warn', 'ok', 'fail']
-export const LANE_RE = /^[a-z0-9-]{1,24}$/
+export const LANE_MAX = 24
+export const LANE_RE = new RegExp('^[a-z0-9-]{1,' + LANE_MAX + '}$')
 export const TITLE_MAX = 32
 export const LINE_MAX = 60
-// Overflow inside this is truncated; past it the caller is confused, so 400 instead of
-// silently throwing away 5KB of text.
 export const TEXT_HARD_CAP = 256
 export const URL_MAX = 256
-// Hosts a lane may make tappable from the lock screen. Deliberately short.
+export const APPROVAL_ID_RE = /^[0-9a-f-]{1,64}$/
 export const URL_HOSTS = ['claude.ai']
-// Exactly claude://code/<id>. Not a general claude:// allowance.
 export const CLAUDE_DEEP_LINK = /^claude:\/\/code\/[A-Za-z0-9_-]{1,64}$/
 export const DEADLINE_PAST_MS = 24 * 3600_000
 export const DEADLINE_FUTURE_MS = 365 * 24 * 3600_000
 
-const truncate = (s, n) => {
+const truncate = (s: string, n: number) => {
   const cp = Array.from(s)
   return cp.length <= n ? s : cp.slice(0, n).join('')
 }
 
-const bad = (reason) => ({ error: reason })
+export type Result<T> = { error: string; value?: undefined } | { error?: undefined; value: T }
+const bad = (reason: string): { error: string; value?: undefined } => ({ error: reason })
 
-function checkText(name, raw, max, out) {
+function checkText(name: string, raw: unknown, max: number, out: any) {
   if (raw === undefined || raw === null) return null
   if (typeof raw !== 'string') return bad(`${name} must be a string`)
   if (raw.length > TEXT_HARD_CAP) return bad(`${name} too long (${raw.length} > ${TEXT_HARD_CAP})`)
@@ -35,14 +29,9 @@ function checkText(name, raw, max, out) {
   return null
 }
 
-// Epoch seconds is the documented unit, but Date.now() hands you milliseconds and
-// passing those silently rendered a countdown to the year 58000 on the lock screen.
-// Nothing in seconds exceeds 1e11 until the year 5138, so treat that as milliseconds.
-const epochMs = (n) => (typeof n === 'number' ? (n > 1e11 ? n : n * 1000) : Date.parse(n))
+const epochMs = (n: unknown) => (typeof n === 'number' ? (n > 1e11 ? n : n * 1000) : Date.parse(String(n)))
 
-// --- per-field rules for POST /activity, walked in this order ---------------
-
-function laneField(body, v) {
+function laneField(body: any, v: any) {
   if (typeof body.lane !== 'string' || !LANE_RE.test(body.lane)) {
     return bad('lane must match ^[a-z0-9-]{1,24}$')
   }
@@ -50,20 +39,15 @@ function laneField(body, v) {
   return null
 }
 
-function templateField(body, v) {
-  if (!TEMPLATES.includes(body.template)) {
+function templateField(body: any, v: any) {
+  if (!(TEMPLATES as readonly string[]).includes(body.template)) {
     return bad(`template must be one of ${TEMPLATES.join(' | ')}`)
   }
   v.template = body.template
   return null
 }
 
-function titleField(body, v) {
-  // No title supplied means "leave the label alone". The poller owns the label;
-  // a hook firing on the same lane must not reset it to the routing key, which is
-  // what put 'cc-chief-b7' on the lock screen. Blank counts as not supplied: an
-  // empty or whitespace title used to slip through checkText and clobber the
-  // label anyway, because '' is a present string and ?? treats it as set.
+function titleField(body: any, v: any) {
   if (body.title === undefined || body.title === null) return null
   if (typeof body.title !== 'string') return bad('title must be a string')
   if (body.title.length > TEXT_HARD_CAP) {
@@ -74,12 +58,22 @@ function titleField(body, v) {
   return null
 }
 
-function lineField(body, v) {
+function lineField(body: any, v: any) {
   v.line = ''
   return checkText('line', body.line, LINE_MAX, v)
 }
 
-function progressField(body, v) {
+/** The act, and the detail under it. Both optional: an older sender posts
+ *  neither and the card falls back to `line`, which is why `line` still ships. */
+function headlineField(body: any, v: any) {
+  return checkText('headline', body.headline, LINE_MAX, v)
+}
+
+function sublineField(body: any, v: any) {
+  return checkText('subline', body.subline, LINE_MAX, v)
+}
+
+function progressField(body: any, v: any) {
   if (body.progress === undefined || body.progress === null) return null
   const n = Number(body.progress)
   if (!Number.isFinite(n)) return bad('progress must be a number 0...1')
@@ -87,11 +81,10 @@ function progressField(body, v) {
   return null
 }
 
-function deadlineField(body, v) {
+function deadlineField(body: any, v: any) {
   if (body.deadline === undefined || body.deadline === null) return null
   const ms = epochMs(body.deadline)
   if (!Number.isFinite(ms)) return bad('deadline must be epoch seconds or an ISO 8601 string')
-  // A deadline outside this window is a unit mistake, not a real date. Fail loudly.
   if (ms < Date.now() - DEADLINE_PAST_MS || ms > Date.now() + DEADLINE_FUTURE_MS) {
     return bad('deadline must be within the last day or the next year')
   }
@@ -99,17 +92,11 @@ function deadlineField(body, v) {
   return null
 }
 
-// A tappable deep link. This lands on his lock screen, so it is a trust boundary:
-// https only, length capped, and host-restricted so a lane cannot put an arbitrary
-// link in front of him.
-function urlField(body, v) {
+function urlField(body: any, v: any) {
   if (body.url === undefined || body.url === null) return null
   if (typeof body.url !== 'string' || body.url.length > URL_MAX) {
     return bad(`url must be a string under ${URL_MAX} chars`)
   }
-  // claude://code/<id> opens the session straight in the Claude app, with no
-  // browser in the path. Allowed as an exact shape rather than as a scheme:
-  // an agent must not be able to put an arbitrary claude:// URL on the lock screen.
   if (CLAUDE_DEEP_LINK.test(body.url)) {
     v.url = body.url
     return null
@@ -124,11 +111,7 @@ function urlField(body, v) {
   return null
 }
 
-// Optional explicit start time. The session poller sends the moment the session
-// went busy so the elapsed timer is honest even when the card starts late (the
-// minBusyMs gate) or the server restarts mid-session. Same unit heuristic as
-// deadline: > 1e11 is milliseconds.
-function startedAtField(body, v) {
+function startedAtField(body: any, v: any) {
   if (body.startedAt === undefined || body.startedAt === null) return null
   const ms = epochMs(body.startedAt)
   if (!Number.isFinite(ms)) return bad('startedAt must be epoch seconds or an ISO 8601 string')
@@ -136,9 +119,23 @@ function startedAtField(body, v) {
   return null
 }
 
-function toneField(body, v) {
+function toneField(body: any, v: any) {
   v.tone = body.tone ?? 'neutral'
-  if (!TONES.includes(v.tone)) return bad(`tone must be one of ${TONES.join(' | ')}`)
+  if (!(TONES as readonly string[]).includes(v.tone)) return bad(`tone must be one of ${TONES.join(' | ')}`)
+  return null
+}
+
+function stateField(body: any, v: any) {
+  if (body.state === undefined || body.state === null) return null
+  if (!isState(body.state)) return bad(`state must be one of ${STATES.join(' | ')}`)
+  v.state = body.state
+  return null
+}
+
+function approvalIdField(body: any, v: any) {
+  if (body.approvalId === undefined || body.approvalId === null) return null
+  if (typeof body.approvalId !== 'string' || !APPROVAL_ID_RE.test(body.approvalId)) return bad('approvalId must be an id')
+  v.approvalId = body.approvalId
   return null
 }
 
@@ -147,20 +144,20 @@ const ACTIVITY_FIELDS = [
   templateField,
   titleField,
   lineField,
+  headlineField,
+  sublineField,
   progressField,
   deadlineField,
   urlField,
   startedAtField,
   toneField,
+  stateField,
+  approvalIdField,
 ]
 
-/**
- * Boundary validation for POST /activity.
- * Returns {error} or {value}. Never throws.
- */
-export function validateActivity(body) {
+export function validateActivity(body: any): Result<any> {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return bad('body must be a JSON object')
-  const v = {}
+  const v: any = {}
   for (const field of ACTIVITY_FIELDS) {
     const e = field(body, v)
     if (e) return e
@@ -168,28 +165,33 @@ export function validateActivity(body) {
   return { value: v }
 }
 
-/** POST /activity/end takes lane plus an optional closing line and tone. */
-export function validateEnd(body) {
+export function validateEnd(body: any): Result<any> {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return bad('body must be a JSON object')
-  const v = {}
+  const v: any = {}
   const laneErr = laneField(body, v)
   if (laneErr) return laneErr
   v.line = 'done'
-  const e = checkText('line', body.line, LINE_MAX, v)
-  if (e) return e
+  for (const f of [
+    (b: any, o: any) => checkText('line', b.line, LINE_MAX, o),
+    headlineField,
+    sublineField,
+  ]) {
+    const e = f(body, v)
+    if (e) return e
+  }
   v.tone = body.tone ?? 'ok'
-  if (!TONES.includes(v.tone)) return bad(`tone must be one of ${TONES.join(' | ')}`)
+  if (!(TONES as readonly string[]).includes(v.tone)) return bad(`tone must be one of ${TONES.join(' | ')}`)
   return { value: v }
 }
 
-/** Content state as the widget's AgentActivity.ContentState decodes it. */
-export function contentStateFor(v, { startedAt, prevTitle } = {}) {
-  const cs = { template: v.template, title: v.title ?? prevTitle ?? v.lane, line: v.line, tone: v.tone }
+export function contentStateFor(v: any, { startedAt, prevTitle }: { startedAt?: number; prevTitle?: string } = {}): Card {
+  const cs: Card = { state: v.state ?? stateOf(v.template, v.tone), title: v.title ?? prevTitle ?? v.lane, line: v.line }
+  if (v.headline !== undefined) cs.headline = v.headline
+  if (v.subline !== undefined) cs.subline = v.subline
   if (v.progress !== undefined) cs.progress = v.progress
-  // Every template carries startedAt: "how long has this been blocking me" is the
-  // whole question on a needs_you card, and its trailing slot was rendering empty.
   if (startedAt) cs.startedAt = appleDate(startedAt)
   if (v.deadline !== undefined) cs.deadline = appleDate(v.deadline)
   if (v.url !== undefined) cs.url = v.url
+  if (v.approvalId !== undefined) cs.approvalId = v.approvalId
   return cs
 }

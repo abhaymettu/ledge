@@ -1,24 +1,23 @@
 {
   "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|resume",
-        "hooks": [
-          { "type": "command", "command": "ledge-notify progress started --progress 0.05" }
-        ]
-      }
-    ],
     "Notification": [
       {
         "hooks": [
-          { "type": "command", "command": "ledge-notify needs_you --tone warn" }
+          {
+            "type": "command",
+            "command": "ledge-notify needs_you --tone warn"
+          }
         ]
       }
     ],
-    "Stop": [
+    "PermissionRequest": [
       {
         "hooks": [
-          { "type": "command", "command": "ledge-notify result done --tone ok --end-after 30" }
+          {
+            "type": "command",
+            "command": "ledge-approve",
+            "timeout": 150
+          }
         ]
       }
     ]

@@ -1,0 +1,44 @@
+#!/usr/bin/env node
+// PermissionRequest hook: put the request on the phone and wait for the answer.
+// Prints an allow/deny decision for Claude Code. Prints nothing (the normal
+// terminal prompt proceeds) when ledge is unreachable or nobody answered in time:
+// nothing is ever allowed without a human.
+
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+
+const WAIT_MS = Number(process.env.LEDGE_APPROVE_WAIT_MS) || 120_000
+
+function config() {
+  const c = JSON.parse(fs.readFileSync(process.env.LEDGE_CONFIG || path.join(os.homedir(), '.ledge', 'config.json'), 'utf8'))
+  return { token: c.token, url: c.url || `http://127.0.0.1:${c.port || 8787}` }
+}
+
+async function main() {
+  let hook
+  try { hook = JSON.parse(fs.readFileSync(0, 'utf8')) } catch { return }
+  if (!hook?.session_id || !hook.tool_name) return
+  // A question with choices is answered in the session, not allowed or denied.
+  if (hook.tool_name === 'AskUserQuestion') return
+  const { token, url } = config()
+  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
+  const opened = await fetch(`${url}/approvals`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ sessionId: hook.session_id, tool: hook.tool_name, input: hook.tool_input, cwd: hook.cwd }),
+  })
+  if (opened.status !== 201) return
+  const { id } = await opened.json()
+  const answered = await fetch(`${url}/approvals/${id}?wait=${WAIT_MS}`, { headers })
+  const { decision } = await answered.json()
+  if (decision !== 'allow' && decision !== 'deny') return
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'PermissionRequest',
+      decision,
+      decisionReason: decision === 'allow' ? 'approved from the phone' : 'denied from the phone',
+    },
+  }))
+}
+
+main().catch(() => {})

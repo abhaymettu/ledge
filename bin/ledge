@@ -23,6 +23,7 @@ ledge - push agent status onto your iPhone lock screen.
   ledge logs [-n LINES] [-f]         show the tail of the server log
   ledge doctor                       check config, server, Apple and sessions
   ledge pair                         print the address and token to type into the app
+  ledge verify                       prove the whole path with a synthetic session
   ledge -h                           this
 
 send options:
@@ -306,7 +307,7 @@ cmd_doctor() {
   # key, team, topic and HTTP/2 connection are all accepted; an auth error does not.
   _self=$0
   while [ -L "$_self" ]; do _self=$(readlink "$_self"); done
-  _apns=$(CDPATH= cd -- "$(dirname -- "$_self")/../server" && pwd)/apns.mjs
+  _apns=$(CDPATH= cd -- "$(dirname -- "$_self")/../server" && pwd)/apns.mts
   reason=$(C="$CFG" LEDGE_APNS="$_apns" node -e '
     // The APNs h2 session is unreferenced, so without this hold node exits before
     // the push resolves and the check silently reports nothing.
@@ -316,7 +317,7 @@ cmd_doctor() {
       const cfg = m.loadConfig(process.env.C);
       const r = await m.sendStart(cfg, "0".repeat(64), {
         lane: "doctor",
-        contentState: { template: "progress", title: "doctor", line: "preflight", tone: "neutral" },
+        contentState: { state: "working", title: "doctor", line: "preflight" },
         alert: { title: "doctor", body: "preflight" },
       });
       m.closeSession();
@@ -373,6 +374,8 @@ case $cmd in
   logs) cmd_logs "$@" ;;
   doctor) cmd_doctor "$@" ;;
   pair) cmd_pair "$@" ;;
+  verify) _self=$0; while [ -L "$_self" ]; do _self=$(readlink "$_self"); done
+          LEDGE_CONFIG="$CFG" node "$(CDPATH= cd -- "$(dirname -- "$_self")/../server" && pwd)/verify.mts" ;;
   -h|--help|help) usage ;;
   *) die "unknown command '$cmd'. ledge -h for usage." ;;
 esac

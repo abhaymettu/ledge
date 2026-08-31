@@ -5,7 +5,9 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildPayload } from './apns.mjs'
+import { buildPayload, authToken, JWT_TTL_MS, send, closeSession, apnsHost, apnsHeaders } from './apns.mts'
+import crypto from 'node:crypto'
+import { writeFileSync } from 'node:fs'
 import {
   validateActivity,
   validateEnd,
@@ -14,7 +16,7 @@ import {
   TITLE_MAX,
   LINE_MAX,
   COALESCE_MS,
-} from './server.mjs'
+} from './server.mts'
 
 const ok = (over = {}) => ({ lane: 'networking', template: 'progress', ...over })
 
@@ -108,6 +110,22 @@ test('validateEnd: same lane rule, defaults to a done/ok close', () => {
   assert.match(validateEnd({ lane: 'phd', line: 'x'.repeat(5000) }).error, /^line too long/)
 })
 
+test('contentState: carries one state, derived from template and tone or given directly', () => {
+  const cs = (over) => contentStateFor(validateActivity(ok(over)).value, {})
+  assert.equal(cs({ template: 'progress' }).state, 'working')
+  assert.equal(cs({ template: 'progress', tone: 'warn' }).state, 'stuck')
+  assert.equal(cs({ template: 'needs_you', tone: 'warn' }).state, 'asking')
+  assert.equal(cs({ template: 'countdown' }).state, 'resting')
+  assert.equal(cs({ template: 'result', tone: 'ok' }).state, 'done')
+  assert.equal(cs({ template: 'result', tone: 'fail' }).state, 'failed')
+  assert.equal(cs({ template: 'progress', tone: 'fail' }).state, 'failed')
+  assert.equal(cs({ template: 'progress', state: 'asking' }).state, 'asking', 'an explicit state wins')
+  assert.match(validateActivity(ok({ state: 'nonsense' })).error ?? '', /^state must be one of/)
+  const wire = cs({ template: 'needs_you' })
+  assert.equal('template' in wire, false, 'the phone sees state, not the API vocabulary')
+  assert.equal('tone' in wire, false)
+})
+
 test('contentState: dates are Apple reference-date seconds, optionals omitted', () => {
   const cs = contentStateFor(validateActivity(ok({})).value, { startedAt: Date.UTC(2001, 0, 1) })
   assert.equal(cs.startedAt, 0)
@@ -198,7 +216,8 @@ test('coalescer: a throwing job does not break the lane', async (t) => {
 // identical cards. Observed live on 2026-08-29 with two "test" cards.
 
 import http from 'node:http'
-import { createHandler } from './server.mjs'
+import { createHandler } from './server.mts'
+import { sublineFor, toolOfLine } from './card.mts'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { rmSync } from 'node:fs'
@@ -210,7 +229,7 @@ const startHarness = async (t, extra = {}) => {
     sendUpdate: async (...a) => (calls.push(['update', ...a]), { status: 200, apnsId: 'B' }),
     sendEnd: async (...a) => (calls.push(['end', ...a]), { status: 200, apnsId: 'C' }),
   }
-  const state = { pushToStartToken: 'pts', deviceToken: 'dev', lanes: {} }
+  const state = { pushToStartToken: 'pts', lanes: {} }
   const stateFile = extra.stateFile ?? join(tmpdir(), `ledge-test-${process.pid}-${Math.random()}.json`)
   const srv = http.createServer(
     createHandler({ cfg: { token: 'tok', bundleId: 'com.test.x' }, ...extra, apns, state, stateFile }),
@@ -234,7 +253,7 @@ test('lanes: each lane\'s last content state, and only with the token', async (t
   const { lanes } = await r.json()
   assert.deepEqual(Object.keys(lanes), ['cc-a'])
   assert.equal(lanes['cc-a'].line, 'one')
-  assert.equal(lanes['cc-a'].template, 'progress')
+  assert.equal(lanes['cc-a'].state, 'working')
   assert.equal((await fetch(base + '/lanes')).status, 401)
 })
 
@@ -268,9 +287,9 @@ test('register: a new push-to-start token tells the poller to repost everything'
   const forgotten = []
   const { post, state } = await startHarness(t, { onForget: (live) => forgotten.push(live) })
   await post('/activity', { lane: 'cc-a', template: 'progress', line: 'one' })
-  await post('/register', { pushToStartToken: 'pts', deviceToken: 'dev' })
+  await post('/register', { pushToStartToken: 'pts' })
   assert.deepEqual(forgotten, [], 'the same token again leaves live cards alone')
-  await post('/register', { pushToStartToken: 'pts2', deviceToken: 'dev' })
+  await post('/register', { pushToStartToken: 'pts2' })
   assert.deepEqual(Object.keys(state.lanes), [])
   assert.deepEqual(forgotten, [[]], 'a changed token wipes the phone, so the poller forgets every card')
 })
@@ -339,7 +358,7 @@ test('relevance: the longest-ignored waiting session wins the Dynamic Island', (
   const score = (mins) =>
     buildPayload({
       event: 'update',
-      contentState: { template: 'needs_you', tone: 'warn', startedAt: ago(mins) },
+      contentState: { state: 'asking', title: 't', line: '', startedAt: ago(mins) },
     }).aps['relevance-score']
   assert.ok(score(30) > score(5), 'ignored longer must outrank freshly asked')
   assert.ok(score(5) > score(0))
@@ -349,19 +368,20 @@ test('relevance: the longest-ignored waiting session wins the Dynamic Island', (
 
 test('relevance: a stuck session outranks a finished one but not a question', () => {
   const of = (cs) => buildPayload({ event: 'update', contentState: cs }).aps['relevance-score']
-  const stuck = of({ template: 'progress', tone: 'warn' })
-  assert.ok(stuck > of({ template: 'result', tone: 'ok' }), 'stuck beats done')
-  assert.ok(stuck > of({ template: 'progress', tone: 'neutral' }), 'stuck beats healthy work')
-  assert.ok(stuck < of({ template: 'needs_you', tone: 'warn' }), 'a real question still wins')
+  const card = (state) => ({ state, title: 't', line: '' })
+  const stuck = of(card('stuck'))
+  assert.ok(stuck > of(card('done')), 'stuck beats done')
+  assert.ok(stuck > of(card('working')), 'stuck beats healthy work')
+  assert.ok(stuck < of(card('asking')), 'a real question still wins')
 })
 
 test('relevance: a blocked lane outranks a working one in the Dynamic Island', () => {
-  const score = (template, tone = 'neutral') =>
-    buildPayload({ event: 'update', contentState: { template, tone } }).aps['relevance-score']
-  assert.ok(score('needs_you') > score('result'), 'needs_you must outrank result')
-  assert.ok(score('result') > score('progress'), 'result must outrank progress')
-  assert.ok(score('progress', 'fail') > score('progress'), 'a failure must outrank a normal run')
-  assert.equal(score('nonsense'), 20, 'unknown templates fall back, never undefined')
+  const score = (state) =>
+    buildPayload({ event: 'update', contentState: { state, title: 't', line: '' } }).aps['relevance-score']
+  assert.ok(score('asking') > score('done'), 'asking must outrank done')
+  assert.ok(score('done') > score('working'), 'done must outrank working')
+  assert.ok(score('failed') > score('working'), 'a failure must outrank a normal run')
+  assert.equal(score('nonsense'), 20, 'an unknown state falls back, never undefined')
 })
 
 test('url: only https claude.ai is tappable from the lock screen', () => {
@@ -470,4 +490,249 @@ test('end after the token: unchanged, ends immediately', async (t) => {
   await post('/token', { lane: 'test', updateToken: 'utok' })
   await post('/activity/end', { lane: 'test' })
   assert.equal(calls.filter((c) => c[0] === 'end').length, 1)
+})
+
+// --- constraints that used to live in comments ---------------------------------
+
+test('payload: start carries attributes-type, attributes and an alert; update and end do not; end carries dismissal-date', () => {
+  const card = { state: 'working', title: 't', line: 'l' }
+  const start = buildPayload({ event: 'start', lane: 'x', contentState: card }).aps
+  assert.equal(start['attributes-type'], 'AgentActivity')
+  assert.deepEqual(start.attributes, { lane: 'x' })
+  assert.deepEqual(start.alert, { title: 'x', body: 'l' })
+  const update = buildPayload({ event: 'update', contentState: card }).aps
+  assert.equal('attributes' in update, false)
+  assert.equal('alert' in update, false)
+  const end = buildPayload({ event: 'end', contentState: card, dismissAt: 1_000_000_000_000 }).aps
+  assert.equal(end['dismissal-date'], 1_000_000_000)
+})
+
+test('jwt: one provider token is reused for JWT_TTL_MS and signed in the JOSE r||s form Apple accepts', (t) => {
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' })
+  const keyPath = join(tmpdir(), `ledge-jwt-${process.pid}.p8`)
+  writeFileSync(keyPath, privateKey.export({ type: 'pkcs8', format: 'pem' }))
+  t.after(() => rmSync(keyPath, { force: true }))
+  const cfg = { teamId: 'TEAM', keyId: 'KEYID', keyPath }
+  const now = Date.now()
+  const a = authToken(cfg, now)
+  assert.equal(authToken(cfg, now + JWT_TTL_MS - 1), a, 'reused inside the window (Apple rejects refreshes under 20 minutes apart)')
+  assert.notEqual(authToken(cfg, now + JWT_TTL_MS + 1), a, 'minted again after it')
+  const [h, p, sig] = a.split('.')
+  assert.deepEqual(JSON.parse(Buffer.from(h, 'base64url')), { alg: 'ES256', kid: 'KEYID' })
+  assert.equal(JSON.parse(Buffer.from(p, 'base64url')).iss, 'TEAM')
+  const ok = crypto.verify('sha256', Buffer.from(`${h}.${p}`), { key: publicKey, dsaEncoding: 'ieee-p1363' }, Buffer.from(sig, 'base64url'))
+  assert.equal(ok, true, 'raw r||s, not DER: DER is what Apple rejects')
+})
+
+test('body: a request over 1MB is refused with 413 before it is parsed', async (t) => {
+  const { base } = await startHarness(t)
+  const r = await fetch(base + '/activity', {
+    method: 'POST',
+    headers: { authorization: 'Bearer tok', 'content-type': 'application/json' },
+    body: JSON.stringify({ lane: 'x', template: 'progress', line: 'a'.repeat(1 << 20) }),
+  }).catch(() => ({ status: 413 }))
+  assert.equal(r.status, 413)
+})
+
+test('activity: a start without a paired phone is 409, not a push to nowhere', async (t) => {
+  const { calls, post, state } = await startHarness(t)
+  state.pushToStartToken = null
+  const r = await post('/activity', { lane: 'x', template: 'progress', line: 'l' })
+  assert.equal(r.status, 409)
+  assert.equal(calls.length, 0)
+})
+
+test('end: a live lane is ended with a dismissal date of now, so the card leaves the lock screen at once', async (t) => {
+  const { calls, post } = await startHarness(t)
+  await post('/activity', { lane: 'x', template: 'progress', line: 'l' })
+  await post('/token', { lane: 'x', updateToken: 'tok' })
+  const before = Date.now()
+  await post('/activity/end', { lane: 'x' })
+  const end = calls.find((c) => c[0] === 'end')
+  assert.ok(end, 'an end was pushed')
+  assert.ok(end[2].dismissAt >= before && end[2].dismissAt <= Date.now() + 1000)
+  assert.equal(end[2].contentState.state, 'done')
+})
+
+// --- approvals -------------------------------------------------------------------
+
+test('approvals: a request is listed, a decision resolves the waiting hook, an unknown id is 404', async (t) => {
+  const { post, base } = await startHarness(t)
+  const get = (p) => fetch(base + p, { headers: { authorization: 'Bearer tok' } })
+  const r = await post('/approvals', { sessionId: 'sess-1', tool: 'Bash', input: { command: 'git push --force', description: 'push the branch' }, cwd: '/x' })
+  assert.equal(r.status, 201)
+  const { id } = await r.json()
+  const listed = (await (await get('/approvals')).json()).approvals
+  assert.equal(listed.length, 1)
+  assert.equal(listed[0].summary, 'push the branch')
+  const waiting = get(`/approvals/${id}?wait=5000`)
+  await new Promise((r) => setTimeout(r, 50))
+  assert.equal((await post(`/approvals/${id}`, { decision: 'allow' })).status, 204)
+  assert.deepEqual(await (await waiting).json(), { decision: 'allow' })
+  assert.equal((await post(`/approvals/${id}`, { decision: 'allow' })).status, 404, 'decided once')
+  assert.equal((await post(`/approvals/${id}`, { decision: 'maybe' })).status, 400)
+})
+
+// The card is the only push Ledge sends. An approval is answered in the app,
+// reached by tapping the card, so opening one must not push anything of its own.
+test('apns: every push is a liveactivity push, on the topic Apple binds to that type', () => {
+  assert.equal(apnsHeaders({ bundleId: 'com.abhay.ledge' })['apns-topic'], 'com.abhay.ledge.push-type.liveactivity')
+})
+
+test('approvals: opening one pushes nothing, the card already on screen carries it', async (t) => {
+  const { calls, post } = await startHarness(t)
+  const r = await post('/approvals', { sessionId: 's', tool: 'Read', input: { file_path: '/a/b' }, cwd: '/x' })
+  assert.equal(r.status, 201, 'the hook is waiting on this')
+  assert.equal(calls.length, 0)
+})
+
+test('approvals: nobody deciding within the wait is no decision, never an allow', async (t) => {
+  const { post, base } = await startHarness(t)
+  const { id } = await (await post('/approvals', { sessionId: 's', tool: 'Edit', input: { file_path: '/a/b.mts' }, cwd: '/x' })).json()
+  const r = await fetch(base + `/approvals/${id}?wait=100`, { headers: { authorization: 'Bearer tok' } })
+  assert.deepEqual(await r.json(), { decision: null })
+})
+
+test('history: an ended lane is kept with its card and outcome, newest last, capped', async (t) => {
+  const { post, base } = await startHarness(t)
+  await post('/activity', { lane: 'cc-a', template: 'progress', line: 'l', title: 'A' })
+  await post('/token', { lane: 'cc-a', updateToken: 'tok' })
+  await post('/activity/end', { lane: 'cc-a', tone: 'fail', line: 'broke' })
+  const { history } = await (await fetch(base + '/history', { headers: { authorization: 'Bearer tok' } })).json()
+  assert.equal(history.length, 1)
+  assert.equal(history[0].lane, 'cc-a')
+  assert.equal(history[0].outcome, 'failed')
+  assert.equal(history[0].card.title, 'A')
+})
+
+test('apns: a token the configured environment rejects is retried on the other one, and that is remembered', async (t) => {
+  t.after(closeSession)
+  closeSession()
+  const bad = { status: 400, apnsId: '', reason: 'BadDeviceToken', body: '', bytes: 0 }
+  const ok = { status: 200, apnsId: 'a', reason: '', body: '', bytes: 0 }
+  const tried: string[] = []
+  // The sideload case: config still says production, the phone holds a sandbox token.
+  const post = async (env, _cfg, _tok, _payload) => {
+    tried.push(env)
+    return env === 'sandbox' ? ok : bad
+  }
+  const cfg = { env: 'production' }
+  const first = await send(cfg, 'tok', { aps: {} }, post)
+  assert.equal(first.status, 200)
+  assert.deepEqual(tried, ['production', 'sandbox'], 'tries the configured host, then the other')
+
+  // Having learned it, the next push must not pay for the rejection again.
+  const second = await send(cfg, 'tok', { aps: {} }, post)
+  assert.equal(second.status, 200)
+  assert.deepEqual(tried, ['production', 'sandbox', 'sandbox'], 'goes straight to what worked')
+
+  // A token both environments reject is a dead token, not a routing problem: report it.
+  closeSession()
+  const dead = await send(cfg, 'tok', { aps: {} }, async () => bad)
+  assert.equal(dead.reason, 'BadDeviceToken')
+})
+
+test('apns: each environment has its own host', () => {
+  assert.equal(apnsHost('production'), 'api.push.apple.com')
+  assert.equal(apnsHost('sandbox'), 'api.sandbox.push.apple.com')
+})
+
+test('payload: a lane finishing alerts, and says which lane and how it went', () => {
+  const done = buildPayload({
+    event: 'end',
+    contentState: { state: 'done', title: 'strafe', line: 'installed' },
+    dismissAt: 1_700_000_000_000,
+  }).aps
+  assert.deepEqual(done.alert, { title: 'strafe', body: 'installed', sound: 'default' })
+  assert.equal(done['dismissal-date'], 1_700_000_000)
+
+  // A failure is the case he most needs to hear about, so it alerts too.
+  const failed = buildPayload({
+    event: 'end',
+    contentState: { state: 'failed', title: 'strafe', line: 'build broke' },
+    dismissAt: 1_700_000_000_000,
+  }).aps
+  assert.equal((failed.alert as any).body, 'build broke')
+})
+
+test('payload: an update alerts only when the card needs him (asking, approval), never for working', () => {
+  const upd = (state) => buildPayload({ event: 'update', contentState: { state, title: 'T', line: 'L' } }).aps
+  assert.deepEqual(upd('asking').alert, { title: 'T', body: 'L', sound: 'default' })
+  assert.deepEqual(upd('approval').alert, { title: 'T', body: 'L', sound: 'default' })
+  for (const s of ['working', 'stuck', 'resting', 'done', 'failed']) assert.equal('alert' in upd(s), false, s)
+})
+
+// ── the hook posts a bare card, the server fills the row under it ──────────
+
+test('sublineFor: the tool when the line names one, the repo when it does not', () => {
+  assert.equal(sublineFor('cc-ledge', 'Claude needs your permission to use AskUserQuestion'),
+    'AskUserQuestion in ledge')
+  assert.equal(sublineFor('cc-ledge', 'Claude needs your permission to use Bash'), 'Bash in ledge')
+  assert.equal(sublineFor('cc-memecoin-edge', 'Claude needs your permission to use mcp__blender__get_scene_info'),
+    'mcp__blender__get_scene_info in memecoin-edge')
+  assert.equal(sublineFor('cc-ledge', 'Claude is waiting for your input'), 'ledge',
+    'no tool named, so only where it came from')
+  assert.equal(sublineFor('cc-chief-b7', 'started'), 'chief-b7')
+})
+
+test('sublineFor: prose that merely contains the phrase names no tool', () => {
+  // The whole point of the shape check: a wrong tool on a permission card is
+  // worse than no tool at all.
+  assert.equal(sublineFor('cc-ledge', 'asked for permission to use the shared drive'), 'ledge')
+  assert.equal(sublineFor('cc-ledge', 'permission to use a colleague machine'), 'ledge')
+  assert.equal(toolOfLine('Claude needs your permission to use the tool'), '')
+  assert.equal(toolOfLine('Claude needs your permission to use Read'), 'Read')
+})
+
+test('sublineFor: nothing to say stays nothing, and it never runs long', () => {
+  assert.equal(sublineFor('', ''), '')
+  assert.equal(sublineFor(undefined, undefined), '')
+  assert.ok(sublineFor('cc-' + 'r'.repeat(80), 'Claude needs your permission to use Bash').length <= 60)
+})
+
+test('a hook-posted card gains a subline without a headline being invented', async (t) => {
+  const { post, base } = await startHarness(t)
+  // Exactly what hooks/ledge-notify sends: no title, no headline, no subline.
+  await post('/activity', {
+    lane: 'cc-ledge', template: 'needs_you', tone: 'warn',
+    line: 'Claude needs your permission to use AskUserQuestion',
+  })
+  const { lanes } = await (await fetch(base + '/lanes', { headers: { authorization: 'Bearer tok' } })).json()
+  const card = lanes['cc-ledge']
+  assert.equal(card.subline, 'AskUserQuestion in ledge', 'the row under the line is filled')
+  assert.equal(card.line, 'Claude needs your permission to use AskUserQuestion')
+  assert.ok(!('headline' in card), 'headline stays absent; the phone falls back to line')
+})
+
+test('the fill never clobbers the frozen identity a poller card established', async (t) => {
+  const { post, base } = await startHarness(t)
+  const read = async () =>
+    (await (await fetch(base + '/lanes', { headers: { authorization: 'Bearer tok' } })).json()).lanes['cc-ledge']
+
+  // The poller names the card.
+  await post('/activity', {
+    lane: 'cc-ledge', template: 'progress', tone: 'neutral', title: 'Lock screen agent',
+    line: 'editing card.mts', headline: 'editing card.mts', subline: '~/Desktop/Playground/ledge',
+  })
+  assert.equal((await read()).title, 'Lock screen agent')
+
+  // The hook posts over it with no title at all, the way ledge-notify does.
+  await post('/activity', {
+    lane: 'cc-ledge', template: 'needs_you', tone: 'warn',
+    line: 'Claude needs your permission to use Bash',
+  })
+  const after = await read()
+  assert.equal(after.title, 'Lock screen agent', 'the name the card was given survives the hook')
+  assert.equal(after.subline, 'Bash in ledge', 'and the derived subline replaces the stale one')
+  assert.equal(after.state, 'asking')
+})
+
+test('a sender that supplies a subline is never second-guessed', async (t) => {
+  const { post, base } = await startHarness(t)
+  await post('/activity', {
+    lane: 'cc-ledge', template: 'needs_you', tone: 'warn',
+    line: 'Claude needs your permission to use Bash', subline: 'said it itself',
+  })
+  const { lanes } = await (await fetch(base + '/lanes', { headers: { authorization: 'Bearer tok' } })).json()
+  assert.equal(lanes['cc-ledge'].subline, 'said it itself')
 })

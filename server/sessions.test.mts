@@ -8,8 +8,10 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { startSessionPoller, selectCards, laneFor, lineFor, titleFor, titleTrim, pathLabel, currentActivity, lastQuestion, stripMd, fmtMins, toolPhrase, DEFAULTS, qualifies , WAITING_FRESH_MS, inferredStatus, withInferredStatus, TRANSCRIPT_HEAD_BYTES } from './sessions.mjs'
-import { summariseTitle, createTitleSummariser, isPathPrompt, recentContext, needsRefresh } from './claude-state.mjs'
+import { startSessionPoller, selectCards, DEFAULTS, qualifies, WAITING_FRESH_MS, IDLE_CARD_MS } from './poller.mts'
+import { laneFor, lineFor, titleTrim, pathLabel, stripMd, fmtMins, toolPhrase } from './card.mts'
+import { titleFor, currentActivity, lastQuestion, inferredStatus, resolveStatus, recentContext, TRANSCRIPT_HEAD_BYTES } from './claude.mts'
+import { summariseTitle, createTitleSummariser, isPathPrompt, needsRefresh } from './titles.mts'
 
 const NOW = () => Date.now()
 
@@ -141,9 +143,9 @@ test('poller: busy -> idle transitions the same lane to needs_you, no end', asyn
   assert.equal(posts(h.calls).length, 2)
   const body = posts(h.calls)[1].body
   assert.equal(body.lane, 'cc-chief-b7')
-  assert.equal(body.template, 'needs_you')
-  assert.equal(body.tone, 'warn')
-  assert.equal(body.line, 'your turn')
+  assert.equal(body.state, 'idle')
+  assert.equal(body.tone, 'neutral')
+  assert.equal(body.line, 'idle')
   assert.equal(body.startedAt, idleAt) // timer counts how long it has waited on him
 })
 
@@ -209,18 +211,28 @@ test('poller: a session parked on a /loop shows a countdown to its wake, not you
   assert.equal(body.deadline, scheduledAt + 600_000)
 })
 
-test('poller: a wake that is overdue past WAKE_GRACE_MS, a stop, or a later prompt is your turn again', async (t) => {
+test('poller: a reply after the wake is scheduled does not cancel it; the loop is still resting', async (t) => {
+  // 2026-08-29: he said "cool ty" to a looping session and its card flipped to
+  // "your turn" for the rest of the wait. The wake keeps its appointment.
+  const h = harness(t)
+  const s = sess({ status: 'idle', statusUpdatedAt: NOW() - 30_000 })
+  h.write(s)
+  h.writeTranscript(s.cwd, s.sessionId, loopTranscript(NOW() - 200_000, NOW() - 100_000, 600, 'watching the dump', [['user', 'cool ty', NOW() - 50_000], ['assistant', [{ type: 'text', text: 'Next check at 23:24.' }], NOW() - 40_000]]))
+  await h.tick()
+  assert.equal(posts(h.calls)[0].body.template, 'countdown')
+})
+
+test('poller: a wake that is overdue past WAKE_GRACE_MS, or a stop, is your turn again', async (t) => {
   for (const [label, transcript] of [
     ['overdue', loopTranscript(NOW() - 900_000, NOW() - 800_000, 60, 'x')],
     ['stopped', (() => { const tr = loopTranscript(NOW() - 200_000, NOW() - 100_000, 600, 'x'); tr[1].message.content[0].input = { stop: true }; return tr })()],
-    ['prompt after', loopTranscript(NOW() - 200_000, NOW() - 100_000, 600, 'x', [['user', 'stop looping', NOW() - 50_000], ['assistant', [{ type: 'text', text: 'Stopped. What next?' }], NOW() - 40_000]])],
   ]) {
     const h = harness(t)
     const s = sess({ status: 'idle', statusUpdatedAt: NOW() - 120_000 })
     h.write(s)
     h.writeTranscript(s.cwd, s.sessionId, transcript)
     await h.tick()
-    assert.equal(posts(h.calls)[0].body.template, 'needs_you', label)
+    assert.equal(posts(h.calls)[0].body.state, 'idle', label)
   }
 })
 
@@ -237,7 +249,7 @@ test('selectCards: a parked loop ranks with the working sessions, not ahead of t
   const mk = (name, status, ago, wake) => ({ ...sess({ name, status, statusUpdatedAt: NOW() - ago }), ...(wake ? { wake } : {}) })
   const cards = new Map([['cc-loop', {}], ['cc-work', {}], ['cc-ask', {}]])
   const { want } = selectCards(
-    [mk('loop', 'idle', 10_000, { at: NOW(), wakeAt: NOW() + 60_000, reason: '' }), mk('work', 'busy', 500_000), mk('ask', 'idle', 20_000)],
+    [mk('loop', 'idle', 10_000, { at: NOW(), wakeAt: NOW() + 60_000, reason: '' }), mk('work', 'busy', 500_000), { ...mk('ask', 'idle', 20_000), question: 'which?' }],
     cards,
     { minBusyMs: 8000, maxCards: 2, alive: () => true },
   )
@@ -298,7 +310,8 @@ test('poller: the card ends only when the pid dies', async (t) => {
   dead = true
   await h.tick()
   assert.equal(ends(h.calls).length, 1)
-  assert.deepEqual(ends(h.calls)[0].body, { lane: 'cc-chief-b7' })
+  assert.deepEqual(ends(h.calls)[0].body, { lane: 'cc-chief-b7', headline: 'idle' },
+    'the last act rides the end, and a card that lived under a minute gets no duration')
 })
 
 test('poller: a vanished session file with a live pid holds the card, no end', async (t) => {
@@ -323,7 +336,7 @@ test('poller: title comes from the first real user prompt, word-boundary truncat
   ])
   h.write(s)
   await h.tick()
-  assert.equal(posts(h.calls)[0].body.title, 'Fix the flapping session cards')
+  assert.equal(posts(h.calls)[0].body.subline, 'Fix the flapping session cards')
 })
 
 test('poller: missing transcript falls back name -> cwd basename -> pid', async (t) => {
@@ -344,7 +357,7 @@ test('poller: the title cache does not re-read the transcript on a second tick',
   h.write(sess({ status: 'idle', statusUpdatedAt: NOW() })) // force a repost
   await h.tick()
   assert.equal(posts(h.calls).length, 2)
-  assert.equal(posts(h.calls)[1].body.title, 'the original prompt')
+  assert.equal(posts(h.calls)[0].body.subline, 'the original prompt', 'cached, never re-read')
 })
 
 test('titleTrim: collapses whitespace, cuts at a word, strips trailing punctuation', () => {
@@ -389,24 +402,38 @@ test('poller: over the cap, a WAITING session beats WORKING ones', async (t) => 
   h.write(sess({ name: 'aa', statusUpdatedAt: NOW() - 300_000 }), '3001.json')
   h.write(sess({ name: 'bb', statusUpdatedAt: NOW() - 100_000 }), '3002.json')
   await h.tick() // cards up: aa, bb
-  // aa flips to waiting (newest statusUpdatedAt of the three)...
+  // aa goes idle with nothing asked: the lowest rank there is...
   h.write(sess({ name: 'aa', status: 'idle', statusUpdatedAt: NOW() }), '3001.json')
-  // ...and cc arrives, busy longer than bb. By busy-time alone, cc+bb would win.
+  // ...and cc arrives working. The working newcomer takes the idle card's slot;
+  // bb, a working card already up, keeps its own (no evict-and-readmit churn).
   h.write(sess({ name: 'cc', statusUpdatedAt: NOW() - 200_000 }), '3003.json')
   await h.tick()
   const last = posts(h.calls).slice(2).map((c) => [c.body.lane, c.body.template])
-  assert.deepEqual(last.sort(), [
-    ['cc-aa', 'needs_you'], // the session that wants him keeps its slot
-    ['cc-cc', 'progress'],
+  assert.deepEqual(last.sort(), [['cc-cc', 'progress']])
+  assert.deepEqual(ends(h.calls).map((c) => c.body.lane), ['cc-aa'], 'the idle card gives way')
+})
+
+test('poller: over the cap, a newcomer that needs him does evict a working card', async (t) => {
+  const h = harness(t, { maxCards: 2 })
+  h.write(sess({ name: 'aa', statusUpdatedAt: NOW() - 300_000 }), '3001.json')
+  h.write(sess({ name: 'bb', statusUpdatedAt: NOW() - 100_000 }), '3002.json')
+  await h.tick()
+  const s = sess({ name: 'cc', status: 'idle', statusUpdatedAt: NOW() - 10_000 })
+  h.write(s, '3003.json')
+  h.writeTranscript(s.cwd, s.sessionId, [
+    { type: 'user', message: { role: 'user', content: 'hello' } },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Deploy to prod now?' }] } },
   ])
-  assert.deepEqual(ends(h.calls).map((c) => c.body.lane), ['cc-bb']) // evicted by the cap
+  await h.tick()
+  assert.deepEqual(ends(h.calls).map((c) => c.body.lane), ['cc-bb'], 'the youngest working card gives way')
+  assert.ok(posts(h.calls).some((c) => c.body.lane === 'cc-cc' && c.body.template === 'needs_you'))
 })
 
 test('selectCards: waiting first, then longest in state, capped', () => {
   const mk = (name, status, ago) => sess({ name, status, statusUpdatedAt: NOW() - ago })
   const cards = new Map([['cc-w', {}], ['cc-a', {}], ['cc-b', {}]])
   const { want } = selectCards(
-    [mk('w', 'idle', 10_000), mk('a', 'busy', 500_000), mk('b', 'busy', 400_000)],
+    [{ ...mk('w', 'idle', 10_000), question: 'ready?' }, mk('a', 'busy', 500_000), mk('b', 'busy', 400_000)],
     cards,
     { minBusyMs: 8000, maxCards: 2, alive: () => true },
   )
@@ -417,7 +444,7 @@ test('selectCards: a session idle past WAITING_FRESH_MS ranks below a working on
   const mk = (name, status, ago) => sess({ name, status, statusUpdatedAt: NOW() - ago })
   const cards = new Map([['cc-stale', {}], ['cc-fresh', {}], ['cc-work', {}]])
   const { want } = selectCards(
-    [mk('stale', 'idle', WAITING_FRESH_MS + 60_000), mk('work', 'busy', 100_000), mk('fresh', 'idle', 60_000)],
+    [mk('stale', 'idle', WAITING_FRESH_MS + 60_000), mk('work', 'busy', 100_000), { ...mk('fresh', 'idle', 60_000), question: 'ok?' }],
     cards,
     { minBusyMs: 8000, maxCards: 2, alive: () => true },
   )
@@ -444,14 +471,14 @@ test('inferredStatus: a turn longer than the tail window is still busy, and its 
   fs.mkdirSync(path.join(proj, '-c'), { recursive: true })
   fs.copyFileSync(file, path.join(proj, '-c', 'x.jsonl'))
   const pinCache = new Map()
-  const a = withInferredStatus(fake, pinCache, proj)
+  const a = resolveStatus(path.join(proj, '-c', 'x.jsonl'), pinCache)
   fs.appendFileSync(path.join(proj, '-c', 'x.jsonl'), rec('assistant', [{ type: 'tool_use', name: 'Read', input: { file_path: '/q' } }], t0 + 300_000) + '\n')
-  const b = withInferredStatus(fake, pinCache, proj)
+  const b = resolveStatus(path.join(proj, '-c', 'x.jsonl'), pinCache)
   assert.equal(a.status, 'busy')
   assert.equal(b.status, 'busy')
   assert.equal(b.statusUpdatedAt, a.statusUpdatedAt, 'pinned: the start does not creep as the window slides')
   fs.appendFileSync(path.join(proj, '-c', 'x.jsonl'), rec('assistant', [{ type: 'text', text: 'done' }], t0 + 400_000) + '\n')
-  const c = withInferredStatus(fake, pinCache, proj)
+  const c = resolveStatus(path.join(proj, '-c', 'x.jsonl'), pinCache)
   assert.deepEqual([c.status, c.statusUpdatedAt], ['idle', t0 + 400_000], 'idle reads the closing text and clears the pin')
 })
 
@@ -629,7 +656,7 @@ test('poller: a WORKING card leads with the current activity, WAITING still says
   fs.rmSync(file) // waiting must not depend on the transcript at all
   h.write(sess({ status: 'idle', statusUpdatedAt: NOW() }))
   await h.tick()
-  assert.equal(posts(h.calls)[1].body.line, 'your turn')
+  assert.equal(posts(h.calls)[1].body.state, 'idle')
 })
 
 test('poller: a WORKING card with no tool_use in the transcript falls back to the cwd line', async (t) => {
@@ -663,7 +690,7 @@ test('poller: adopts cards left by a previous run instead of orphaning them', as
   const sent = posts(h.calls)
   assert.equal(sent.length, 1, 'the adopted card should be refreshed, not ignored')
   assert.equal(sent[0].body.lane, 'cc-demo')
-  assert.equal(sent[0].body.template, 'needs_you', 'an idle adopted session is WAITING')
+  assert.equal(sent[0].body.state, 'idle', 'an idle adopted session is idle, not waiting')
   assert.equal(ends(h.calls).length, 0, 'adopting must not end it')
 })
 
@@ -759,7 +786,7 @@ test('poller: a WAITING card with no question in the transcript says your turn',
   await h.tick()
   h.write(sess({ status: 'idle', statusUpdatedAt: NOW() }))
   await h.tick()
-  assert.equal(posts(h.calls)[1].body.line, 'your turn')
+  assert.equal(posts(h.calls)[1].body.state, 'idle')
 })
 
 // --- stuck detection -------------------------------------------------------
@@ -901,6 +928,35 @@ test('summariseTitle: truncates the context to 600 chars and accepts a clean ans
   assert.ok(got.includes('currently working on'), 'the instruction asks about the present, not the start')
 })
 
+test('summariseTitle: a title is a name, so trailing sentence punctuation comes off', async () => {
+  const of = (out) => summariseTitle('p', async () => out)
+  // The one he caught: a full stop above a subline that has none.
+  assert.equal(await of('Runway plan archival.'), 'Runway plan archival')
+  assert.equal(await of('Fix the flapping cards?'), 'Fix the flapping cards')
+  assert.equal(await of('Shipped it!'), 'Shipped it')
+  assert.equal(await of('Runway plan archival...'), 'Runway plan archival', 'a run comes off together')
+  assert.equal(await of('Runway plan archival…'), 'Runway plan archival', 'and so does the single character')
+  assert.equal(await of('  Runway plan archival .  '), 'Runway plan archival', 'the space it hid goes too')
+})
+
+test('summariseTitle: stripping decides length, and never touches the middle of a name', async () => {
+  const of = (out) => summariseTitle('p', async () => out)
+  // The case that only becomes valid after the strip: 32 characters raw, which
+  // the length check rejects, and 31 once the full stop is gone.
+  const edge = 'Comprehensive refactoring works.'
+  assert.equal(edge.length, 32)
+  assert.equal(await of(edge), 'Comprehensive refactoring works')
+  assert.equal(
+    await of('Extraordinarily Comprehensive Refactoring.'), null,
+    'and one that is still too long once stripped stays rejected',
+  )
+
+  assert.equal(await of('Ledge v1.2 rollout'), 'Ledge v1.2 rollout', 'internal punctuation is left alone')
+  assert.equal(await of('Fix card.mts parsing'), 'Fix card.mts parsing')
+  assert.equal(await of('...'), null, 'nothing left after the strip')
+  assert.equal(await of('Webhook.'), null, 'one word is still one word')
+})
+
 test('summariseTitle: refusal, empty, multi-line, quoted, long, or error all yield null', async () => {
   const of = (out) => summariseTitle('p', async () => out)
   assert.equal(await of('I cannot produce a title for this request'), null) // >5 words
@@ -913,16 +969,18 @@ test('summariseTitle: refusal, empty, multi-line, quoted, long, or error all yie
   assert.equal(await summariseTitle('p', async () => { throw new Error('timeout') }), null)
 })
 
-test('poller: a good summarised title replaces the trimmed prompt on the next tick', async (t) => {
+test('poller: the summarised title becomes the name, and stops being the subline', async (t) => {
   const h = harness(t, {}, { titleRun: async () => 'Flapping card fix' })
   const s = sess()
   h.writeTranscript(s.cwd, s.sessionId, [user('Fix the flapping session cards on my phone please')])
   h.write(s)
   await h.tick()
-  assert.equal(posts(h.calls)[0].body.title, 'Fix the flapping session cards')
+  assert.equal(posts(h.calls)[0].body.title, 'chief-b7', 'no title yet, so the session name holds the row')
+  assert.equal(posts(h.calls)[0].body.subline, 'Fix the flapping session cards')
   await settle()
   await h.tick()
-  assert.equal(posts(h.calls)[1].body.title, 'Flapping card fix')
+  assert.equal(posts(h.calls)[1].body.title, 'Flapping card fix', 'the summary takes the name')
+  assert.notEqual(posts(h.calls)[1].body.subline, 'Flapping card fix', 'and is not printed twice')
 })
 
 test('poller: a rejected answer keeps the fallback permanently, one CLI call ever', async (t) => {
@@ -938,7 +996,7 @@ test('poller: a rejected answer keeps the fallback permanently, one CLI call eve
     await h.tick()
     const sent = posts(h.calls)
     assert.equal(sent.length, 2)
-    assert.equal(sent[1].body.title, 'Fix the flapping session cards', `fallback kept for ${JSON.stringify(bad.slice(0, 12))}`)
+    assert.equal(sent[0].body.subline, 'Fix the flapping session cards', `fallback kept for ${JSON.stringify(bad.slice(0, 12))}`)
     assert.equal(runs.length, 1, 'no retry, ever')
   }
 })
@@ -949,7 +1007,7 @@ test('poller: the tick is not blocked by a pending summarisation', async (t) => 
   h.writeTranscript(s.cwd, s.sessionId, [user('Fix the flapping session cards on my phone please')])
   h.write(s)
   await h.tick() // would hang here if the tick awaited the CLI
-  assert.equal(posts(h.calls)[0].body.title, 'Fix the flapping session cards')
+  assert.equal(posts(h.calls)[0].body.subline, 'Fix the flapping session cards')
 })
 
 test('poller: the disk cache round-trips and prevents a second CLI call', async (t) => {
@@ -970,7 +1028,7 @@ test('poller: the disk cache round-trips and prevents a second CLI call', async 
   b.write(s)
   await b.tick()
   await settle()
-  assert.equal(posts(b.calls)[0].body.title, 'Lock screen agent')
+  assert.equal(posts(b.calls)[0].body.title, 'Lock screen agent', 'restored from disk as the name')
   assert.equal(runs.length, 0, 'a known session never costs a second call')
 })
 
@@ -984,7 +1042,7 @@ test('poller: summariseTitles false never invokes the runner', async (t) => {
   await settle()
   await h.tick()
   assert.equal(runs.length, 0)
-  assert.equal(posts(h.calls)[0].body.title, 'Fix the flapping session cards')
+  assert.equal(posts(h.calls)[0].body.subline, 'Fix the flapping session cards')
 })
 
 test('poller: three new sessions are summarised one at a time, none stranded', async (t) => {
@@ -1192,7 +1250,7 @@ test('summariser: the disk cache round-trips {title, at} and keeps the schedule 
   const a = createTitleSummariser({ cachePath: cache, titleRefreshMs: 100, now: () => clock, run: async () => 'Alpha Beta' })
   a.request('s', 'a prose first prompt with plenty of words', 'fb')
   await settle()
-  assert.deepEqual(JSON.parse(fs.readFileSync(cache, 'utf8')), { s: { title: 'Alpha Beta', at: 1_000_000 } })
+  assert.deepEqual(JSON.parse(fs.readFileSync(cache, 'utf8')), { s: { title: 'Alpha Beta', at: 1_000_000, first: 'Alpha Beta' } })
   let calls = 0
   const b = createTitleSummariser({ cachePath: cache, titleRefreshMs: 100, now: () => clock, run: async () => (calls++, 'Gamma Delta') })
   assert.equal(b.known('s'), 'Alpha Beta', 'the restart loads the title')
@@ -1250,7 +1308,7 @@ test('poller: a drifted session is re-summarised from recent activity and the ca
   await h.tick()
   await settle()
   await h.tick()
-  assert.equal(posts(h.calls)[1].body.title, 'Memecoin edge hunt')
+  assert.equal(posts(h.calls)[1].body.title, 'Memecoin edge hunt', 'the first summary names the card')
   await new Promise((r) => setTimeout(r, 10)) // let the transcript mtime pass the summary's `at`
   h.writeTranscript(s.cwd, s.sessionId, [
     user('hunt for memecoin edge opportunities overnight please'),
@@ -1261,6 +1319,86 @@ test('poller: a drifted session is re-summarised from recent activity and the ca
   await h.tick() // and the better title posts on the next tick
   const sent = posts(h.calls)
   const last = sent[sent.length - 1].body
-  assert.equal(last.title, 'Kalshi dead pool')
+  assert.ok(sent.some((p: any) => p.body.subline === 'Kalshi dead pool'),
+    'the drifted summary reaches the subline, where changing is correct')
+  assert.equal(last.title, 'Memecoin edge hunt', 'and the name it was given never moves')
   assert.equal(last.lane, 'cc-chief-b7', 'same card, updated in place')
+})
+
+// --- constraints that used to live in comments ---------------------------------
+
+test('toolPhrase: a hostile tool name cannot reach up the prototype chain', () => {
+  for (const name of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+    assert.equal(toolPhrase({ name, input: {} }), name.toLowerCase(), name)
+  }
+})
+
+test('stripMd: leaves snake_case underscores alone; they are identifiers, not italics', () => {
+  assert.equal(stripMd('rename get_user_id to fetch_id'), 'rename get_user_id to fetch_id')
+})
+
+test('laneFor: a suffixed lane still fits the lane bound the validator enforces', () => {
+  const long = { name: 'x'.repeat(40), pid: 12345 }
+  assert.ok(laneFor(long).length <= 24)
+})
+
+test('poller: a session with a pending approval shows an approval card naming what it wants, with the id', async (t) => {
+  const approvals = { forSession: (sid) => (sid === '925fb8cf-0000-0000-0000-000000000000' ? { id: 'abc-123', summary: 'git push --force', at: NOW() - 5000 } : undefined) }
+  const h = harness(t, {}, { approvals })
+  h.write(sess())
+  await h.tick()
+  const body = posts(h.calls)[0].body
+  assert.equal(body.state, 'approval')
+  assert.equal(body.line, 'allow: git push --force')
+  assert.equal(body.approvalId, 'abc-123')
+  assert.equal(body.template, 'needs_you', 'the API vocabulary still rides along for the validator')
+})
+
+test('lastQuestion: a multiple-choice AskUserQuestion shows its question, not "your turn"', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ledge-auq-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const file = path.join(dir, 'x.jsonl')
+  const rec = (type, content) => JSON.stringify({ type, timestamp: new Date().toISOString(), message: { role: type, content } })
+  fs.writeFileSync(file, [
+    rec('assistant', [{ type: 'text', text: 'Some earlier question?' }]),
+    rec('assistant', [{ type: 'tool_use', name: 'AskUserQuestion', input: { questions: [{ question: 'Which repo model?', header: 'Repo', options: [{ label: 'a' }, { label: 'b' }] }] } }]),
+  ].join('\n') + '\n')
+  assert.equal(lastQuestion(file), 'Which repo model?')
+})
+
+test('poller: idle means idle: no question, no wake, the last thing it said, and the card expires after IDLE_CARD_MS', async (t) => {
+  const h = harness(t)
+  h.write(sess())
+  await h.tick()
+  const s = sess({ status: 'idle', statusUpdatedAt: NOW() - 60_000 })
+  h.write(s)
+  h.writeTranscript(s.cwd, s.sessionId, [
+    { type: 'user', message: { role: 'user', content: 'ship it' } },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Pushed to main. Build 21 is in TestFlight.' }] } },
+  ])
+  await h.tick()
+  const body = posts(h.calls)[1].body
+  assert.equal(body.state, 'idle')
+  assert.equal(body.line, 'Build 21 is in TestFlight')
+  h.write(sess({ status: 'idle', statusUpdatedAt: NOW() - IDLE_CARD_MS - 1000 }))
+  await h.tick()
+  assert.deepEqual(ends(h.calls).map((c) => c.body.lane), ['cc-chief-b7'], 'an idle card leaves the lock screen after IDLE_CARD_MS')
+})
+
+test('poller: a busy session blocked in Monitor is resting, not working, and never stuck', async (t) => {
+  // 2026-08-30: a /loop session sat in a Monitor call for 19 minutes and showed as
+  // "working ~/chief". A waiting tool is the loop between its checks.
+  const h = harness(t, { stuckAfterMs: 1 })
+  const s = sess()
+  h.write(s)
+  h.writeTranscript(s.cwd, s.sessionId, [
+    { type: 'user', message: { role: 'user', content: '/loop watch the payout batch' } },
+    { type: 'assistant', timestamp: new Date(NOW() - 60_000).toISOString(), message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Monitor', input: { command: 'until ...; do sleep 60; done', description: 'watching the payout batch' } }] } },
+  ])
+  await h.tick()
+  const body = posts(h.calls)[0].body
+  assert.equal(body.state, 'resting')
+  assert.equal(body.line, 'watching the payout batch')
+  assert.equal(body.tone, 'neutral')
+  assert.equal('deadline' in body, false, 'no wake time is known for a Monitor')
 })

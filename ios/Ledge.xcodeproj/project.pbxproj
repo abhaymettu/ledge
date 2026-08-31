@@ -16,6 +16,10 @@
 		BF0000000000000000000007 /* LedgeLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = FR0000000000000000000008 /* LedgeLiveActivity.swift */; };
 		BF0000000000000000000008 /* AgentActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = FR0000000000000000000010 /* AgentActivity.swift */; };
 		BF0000000000000000000009 /* LedgeWidgetExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = PD0000000000000000000002 /* LedgeWidgetExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		BF0000000000000000000021 /* LedgeShared.swift in Sources */ = {isa = PBXBuildFile; fileRef = FR0000000000000000000011 /* LedgeShared.swift */; };
+		BF0000000000000000000022 /* LedgeShared.swift in Sources */ = {isa = PBXBuildFile; fileRef = FR0000000000000000000011 /* LedgeShared.swift */; };
+		BF0000000000000000000023 /* LedgeHomeWidgets.swift in Sources */ = {isa = PBXBuildFile; fileRef = FR0000000000000000000012 /* LedgeHomeWidgets.swift */; };
+		BF0000000000000000000029 /* LedgeInk.swift in Sources */ = {isa = PBXBuildFile; fileRef = FR0000000000000000000018 /* LedgeInk.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -43,8 +47,6 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		PD0000000000000000000001 /* Ledge.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Ledge.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		PD0000000000000000000002 /* LedgeWidgetExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LedgeWidgetExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		FR0000000000000000000001 /* LedgeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LedgeApp.swift; sourceTree = "<group>"; };
 		FR0000000000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		FR0000000000000000000003 /* LedgeStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LedgeStore.swift; sourceTree = "<group>"; };
@@ -55,6 +57,12 @@
 		FR0000000000000000000008 /* LedgeLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LedgeLiveActivity.swift; sourceTree = "<group>"; };
 		FR0000000000000000000009 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		FR0000000000000000000010 /* AgentActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentActivity.swift; sourceTree = "<group>"; };
+		FR0000000000000000000011 /* LedgeShared.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LedgeShared.swift; sourceTree = "<group>"; };
+		FR0000000000000000000012 /* LedgeHomeWidgets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LedgeHomeWidgets.swift; sourceTree = "<group>"; };
+		FR0000000000000000000013 /* LedgeWidget.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = LedgeWidget.entitlements; sourceTree = "<group>"; };
+		FR0000000000000000000018 /* LedgeInk.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LedgeInk.swift; sourceTree = "<group>"; };
+		PD0000000000000000000001 /* Ledge.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Ledge.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		PD0000000000000000000002 /* LedgeWidgetExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LedgeWidgetExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -103,6 +111,8 @@
 			children = (
 				FR0000000000000000000007 /* LedgeWidgetBundle.swift */,
 				FR0000000000000000000008 /* LedgeLiveActivity.swift */,
+				FR0000000000000000000012 /* LedgeHomeWidgets.swift */,
+				FR0000000000000000000013 /* LedgeWidget.entitlements */,
 				FR0000000000000000000009 /* Info.plist */,
 			);
 			path = LedgeWidget;
@@ -112,6 +122,8 @@
 			isa = PBXGroup;
 			children = (
 				FR0000000000000000000010 /* AgentActivity.swift */,
+				FR0000000000000000000011 /* LedgeShared.swift */,
+				FR0000000000000000000018 /* LedgeInk.swift */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -225,6 +237,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				BF0000000000000000000005 /* AgentActivity.swift in Sources */,
+				BF0000000000000000000021 /* LedgeShared.swift in Sources */,
+				BF0000000000000000000029 /* LedgeInk.swift in Sources */,
 				BF0000000000000000000003 /* LedgeStore.swift in Sources */,
 				BF0000000000000000000002 /* ContentView.swift in Sources */,
 				BF0000000000000000000001 /* LedgeApp.swift in Sources */,
@@ -236,7 +250,9 @@
 			buildActionMask = 2147483647;
 			files = (
 				BF0000000000000000000008 /* AgentActivity.swift in Sources */,
+				BF0000000000000000000022 /* LedgeShared.swift in Sources */,
 				BF0000000000000000000007 /* LedgeLiveActivity.swift in Sources */,
+				BF0000000000000000000023 /* LedgeHomeWidgets.swift in Sources */,
 				BF0000000000000000000006 /* LedgeWidgetBundle.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -256,7 +272,6 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
-				LEDGE_BUNDLE_ID = com.abhay.ledge;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ENABLE_MODULES = YES;
@@ -275,6 +290,7 @@
 					"$(inherited)",
 				);
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LEDGE_BUNDLE_ID = com.abhay.ledge;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -289,7 +305,6 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
-				LEDGE_BUNDLE_ID = com.abhay.ledge;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ENABLE_MODULES = YES;
@@ -302,6 +317,7 @@
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LEDGE_BUNDLE_ID = com.abhay.ledge;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = iphoneos;
@@ -318,7 +334,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Ledge/Ledge.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 14;
+				CURRENT_PROJECT_VERSION = 28;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Ledge/Info.plist;
@@ -344,7 +360,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Ledge/Ledge.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 14;
+				CURRENT_PROJECT_VERSION = 28;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Ledge/Info.plist;
@@ -366,8 +382,9 @@
 		BC0000000000000000000005 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = LedgeWidget/LedgeWidget.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 14;
+				CURRENT_PROJECT_VERSION = 28;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = LedgeWidget/Info.plist;
@@ -389,8 +406,9 @@
 		BC0000000000000000000006 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = LedgeWidget/LedgeWidget.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 14;
+				CURRENT_PROJECT_VERSION = 28;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = LedgeWidget/Info.plist;

@@ -61,7 +61,7 @@ chmod 700 "$LEDGE"
 
 # --- repo ----------------------------------------------------------------------
 
-if [ -f ./server/server.mjs ] && [ -f ./install.sh ]; then
+if [ -f ./server/server.mts ] && [ -f ./install.sh ]; then
   ROOT=$(pwd)
 else
   ROOT=${LEDGE_HOME:-$LEDGE/ledge}
@@ -131,6 +131,7 @@ EOF
 if [ -w /usr/local/bin ]; then BIN=/usr/local/bin; else BIN=$HOME/.local/bin; mkdir -p "$BIN"; fi
 ln -sf "$ROOT/bin/ledge" "$BIN/ledge"
 ln -sf "$ROOT/hooks/ledge-notify" "$BIN/ledge-notify"
+ln -sf "$ROOT/hooks/ledge-approve" "$BIN/ledge-approve"
 case ":$PATH:" in
   *":$BIN:"*) ;;
   *) warn "$BIN is not on your PATH. Add it to your shell profile: export PATH=\"$BIN:\$PATH\"" ;;

@@ -28,7 +28,7 @@ struct LedgeApp: App {
                     case "claude":
                         LedgeStore.shared.handingOff = true
                         UIApplication.shared.open(url)
-                    case "ledge": LedgeStore.shared.focusedLane = url.host() ?? url.pathComponents.last
+                    case "ledge": if url.host() == "lane" { LedgeStore.shared.focusedLane = url.pathComponents.last }
                     default: break
                     }
                 }

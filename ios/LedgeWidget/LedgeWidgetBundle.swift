@@ -5,5 +5,7 @@ import WidgetKit
 struct LedgeWidgetBundle: WidgetBundle {
     var body: some Widget {
         LedgeLiveActivity()
+        NeedsYouWidget()
+        FleetWidget()
     }
 }
